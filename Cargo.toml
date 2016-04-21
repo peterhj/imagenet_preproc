@@ -1,0 +1,20 @@
+[package]
+name = "imagenet_preproc"
+version = "0.0.1"
+authors = ["Peter Jin <peterhaijin@gmail.com>"]
+
+[lib]
+name = "imagenet_preproc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "preproc-archive"
+path = "tools/preproc-archive.rs"
+
+[dependencies]
+rand = "*"
+rustc-serialize = "*"
+
+csv = "*"
+image = { path = "../image" }
+tar = "*"
