@@ -14,7 +14,14 @@ path = "tools/preproc-archive.rs"
 [dependencies]
 rand = "*"
 rustc-serialize = "*"
+time = "*"
 
+byteorder = "*"
+#chan = "*"
 csv = "*"
 image = { path = "../image" }
+memmap = "*"
 tar = "*"
+threadpool = "*"
+
+varraydb = { path = "../varraydb" }

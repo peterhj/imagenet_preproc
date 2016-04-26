@@ -7,8 +7,8 @@ def main():
   print(meta_mat["synsets"].shape)
   #print(meta_mat["synsets"])
 
-  with open("raw_cats_db.csv", "w") as f:
-    print("wnid,raw_cat", file=f)
+  with open("wnid_raw_cats_db.csv", "w") as f:
+    #print("wnid,raw_cat", file=f)
     for row in meta_mat["synsets"]:
       #print(row)
       #print(row[0])
