@@ -20,6 +20,7 @@ byteorder = "*"
 #chan = "*"
 csv = "*"
 image = { path = "../image" }
+#magick = { path = "../magick" }
 memmap = "*"
 tar = "*"
 threadpool = "*"

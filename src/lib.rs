@@ -4,6 +4,7 @@ extern crate byteorder;
 //extern crate chan;
 extern crate csv;
 extern crate image;
+//extern crate magick;
 extern crate memmap;
 extern crate tar;
 extern crate threadpool;
@@ -18,6 +19,7 @@ use image::{GenericImage, ImageBuffer, Rgb, ColorType, ImageDecoder, DecodingRes
 use image::{DynamicImage, ImageFormat, load};
 use image::imageops::{FilterType, resize};
 //use image::jpeg::{JPEGDecoder};
+//use magick::{MagickWand, FilterType as MagickFilterType};
 use memmap::{Mmap, Protection};
 use tar::{Archive};
 use threadpool::{ThreadPool};
@@ -57,12 +59,14 @@ struct WnidRawCatRecord {
 }
 
 enum EncoderMsg {
-  ImageFile(usize, i32, Vec<u8>),
+  RawImageFile(usize, i32, Vec<u8>),
+  Quit,
 }
 
 enum WriterMsg {
   Skip(usize),
   ImageFile(usize, i32, Vec<u8>),
+  Quit,
 }
 
 struct ReaderWorker {
@@ -104,7 +108,7 @@ impl ReaderWorker {
         }
 
         self.encoder_txs[counter % NUM_ENCODERS].send(
-            EncoderMsg::ImageFile(counter, rawcat, buf),
+            EncoderMsg::RawImageFile(counter, rawcat, buf),
         ).unwrap();
         counter += 1;
       }
@@ -112,16 +116,83 @@ impl ReaderWorker {
       let elapsed = (lap_time - start_time).num_milliseconds() as f32 * 0.001;
       println!("DEBUG: processed: {} elapsed: {:.3}", counter, elapsed);
     }
+    for enc_idx in 0 .. NUM_ENCODERS {
+      self.encoder_txs[counter % NUM_ENCODERS].send(
+          EncoderMsg::Quit,
+      ).unwrap();
+    }
   }
 }
 
-struct EncoderWorker {
+/*struct MagickEncoderWorker {
   config:       IlsvrcConfig,
   encoder_rx:   Receiver<EncoderMsg>,
   writer_tx:    SyncSender<WriterMsg>,
 }
 
-impl EncoderWorker {
+impl MagickEncoderWorker {
+  pub fn run(&mut self) {
+    let wand = MagickWand::new();
+    loop {
+      match self.encoder_rx.recv() {
+        //Err(_) | Ok(EncoderMsg::Quit) => {
+        Err(_) => {
+          break;
+        }
+        Ok(EncoderMsg::RawImageFile(idx, rawcat, raw_buf)) => {
+          //let mut reader = Cursor::new(&buf);
+
+          match wand.read_image_blob(raw_buf) {
+            Err(e) => {
+              println!("WARNING: decoding failed: {} {:?}", idx, e);
+              continue;
+            }
+            Ok(_) => {}
+          }
+
+          let image_width = wand.get_image_width();
+          let image_height = wand.get_image_height();
+          let min_side = min(image_width, image_height);
+
+          if min_side <= self.config.resize_smaller_dim {
+            // Do nothing.
+          } else {
+            wand.resize_image(image_width, image_height, MagickFilterType::LanczosFilter, 1.0);
+          }
+
+          match wand.write_image_blob("PNG") {
+            Err(e) => {
+              println!("WARNING: failed to save as png: {} {:?}", idx, e);
+              continue;
+            }
+            Ok(encoded_buf) => {
+              let test_buf = encoded_buf.clone();
+              match wand.read_image_blob(test_buf) {
+                Err(e) => {
+                  println!("WARNING: failed to correctly save as png: {} {:?}", idx, e);
+                  continue;
+                }
+                Ok(_) => {}
+              }
+
+              self.writer_tx.send(
+                  WriterMsg::ImageFile(idx, rawcat, encoded_buf),
+              ).unwrap();
+            }
+          }
+        }
+      }
+    }
+  }
+}*/
+
+struct PistonEncoderWorker {
+  config:       IlsvrcConfig,
+  encoder_rx:   Receiver<EncoderMsg>,
+  writer_tx:    SyncSender<WriterMsg>,
+}
+
+impl PistonEncoderWorker {
   pub fn run(&mut self) {
     loop {
       match self.encoder_rx.recv() {
@@ -129,7 +200,13 @@ impl EncoderWorker {
         Err(_) => {
           break;
         }
-        Ok(EncoderMsg::ImageFile(idx, rawcat, buf)) => {
+        Ok(EncoderMsg::Quit) => {
+          self.writer_tx.send(
+              WriterMsg::Quit,
+          ).unwrap();
+          break;
+        }
+        Ok(EncoderMsg::RawImageFile(idx, rawcat, buf)) => {
           let mut reader = Cursor::new(&buf);
           let mut image = None;
           match load(reader, ImageFormat::JPEG) {
@@ -177,15 +254,22 @@ impl EncoderWorker {
           let min_side = min(image_dims.0, image_dims.1);
           //println!("DEBUG: min side: {} dims: {:?} path: {:?}", min_side, image_dims, im_path);
 
+          let mut is_new = false;
           let mut encoded_image = vec![];
           if min_side <= self.config.resize_smaller_dim {
+            /*let image_buf = match image.as_rgb8() {
+              Some(buf) => buf.clone(),
+              None => panic!("failed to interpret image as rgb8"),
+            };*/
             let image_buf = image.to_rgb();
             let image = DynamicImage::ImageRgb8(image_buf);
             match image.save(&mut encoded_image, ImageFormat::PNG) {
-              Err(e) => panic!("failed to encode image as png: {:?}", e),
+              Err(e) => panic!("failed to encode old image as png: {:?}", e),
               Ok(_) => {}
             }
           } else {
+            is_new = true;
+
             let (old_width, old_height) = image_dims;
             let (new_width, new_height) = if old_width < old_height {
               (min_side, (min_side as f32 / old_width as f32 * old_height as f32).round() as u32)
@@ -195,15 +279,34 @@ impl EncoderWorker {
               (min_side, min_side)
             };
 
+            /*let old_image_buf = match image.as_rgb8() {
+              Some(buf) => buf.clone(),
+              None => panic!("failed to interpret image as rgb8"),
+            };*/
             let old_image_buf = image.to_rgb();
             let new_image_buf = resize(&old_image_buf, new_width as u32, new_height as u32, FilterType::Lanczos3);
 
             let new_image = DynamicImage::ImageRgb8(new_image_buf);
             match new_image.save(&mut encoded_image, ImageFormat::PNG) {
-              Err(e) => panic!("failed to encode image as png: {:?}", e),
+              Err(e) => panic!("failed to encode new image as png: {:?}", e),
               Ok(_) => {}
             }
           }
+
+          {
+            let mut test_reader = Cursor::new(&encoded_image);
+            match load(test_reader, ImageFormat::PNG) {
+              Err(e) => {
+                println!("WARNING: failed to decode the (new? {:?}) encoded image as png: {} {:?}", is_new, idx, e);
+                self.writer_tx.send(
+                    WriterMsg::Skip(idx),
+                ).unwrap();
+                continue;
+              }
+              Ok(_) => {}
+            }
+          }
+
           self.writer_tx.send(
               WriterMsg::ImageFile(idx, rawcat, encoded_image),
           ).unwrap();
@@ -221,6 +324,7 @@ struct WriterWorker {
 
 impl WriterWorker {
   pub fn run(&mut self) {
+    let mut quit_count = 0;
     //let mut adj_idx = 0;
     let mut skip_set: HashSet<usize> = HashSet::new();
     let mut cache: BTreeMap<usize, (Vec<u8>, Vec<u8>)> = BTreeMap::new();
@@ -230,6 +334,15 @@ impl WriterWorker {
       match self.writer_rx.recv() {
         Err(_) => {
           break;
+        }
+
+        Ok(WriterMsg::Quit) => {
+          quit_count += 1;
+          if quit_count >= NUM_ENCODERS {
+            assert!(cache.is_empty());
+            println!("DEBUG: total number skipped: {}", skip_set.len());
+            break;
+          }
         }
 
         Ok(WriterMsg::Skip(idx)) => {
@@ -355,7 +468,7 @@ pub fn preproc_archive(config: &IlsvrcConfig) {
     let encoder_rx = encoder_rxs[i].take().unwrap();
     let writer_tx = writer_tx.clone();
     encoder_pool.execute(move || {
-      EncoderWorker{
+      PistonEncoderWorker{
         config:     config,
         encoder_rx: encoder_rx,
         writer_tx:  writer_tx,

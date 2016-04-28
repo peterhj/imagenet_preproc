@@ -14,8 +14,8 @@ fn main() {
     resize_smaller_dim:   480,
     keep_aspect_ratio:    true,
 
-    train_data_path:      PathBuf::from("/rscratch/phj/data/ilsvrc2012_scale480/ilsvrc2012_scale480_train_data.varraydb"),
-    train_labels_path:    PathBuf::from("/rscratch/phj/data/ilsvrc2012_scale480/ilsvrc2012_scale480_train_labels.varraydb"),
+    train_data_path:      PathBuf::from("/rscratch/phj/data/ilsvrc2012_scale480_orig_v2a/ilsvrc2012_scale480_train_data.varraydb"),
+    train_labels_path:    PathBuf::from("/rscratch/phj/data/ilsvrc2012_scale480_orig_v2a/ilsvrc2012_scale480_train_labels.varraydb"),
   };
 
   preproc_archive(&config);
