@@ -11,11 +11,15 @@ fn main() {
     valid_archive_path:   PathBuf::from("/scratch/phj/data/ilsvrc2012_raw/ILSVRC2012_img_val.tar"),
     valid_rawcats_path:   PathBuf::from("ILSVRC2012_validation_ground_truth.txt"),
 
-    resize_smaller_dim:   480,
+    resize_smaller_dim:   Some(480),
     keep_aspect_ratio:    true,
 
-    train_data_path:      PathBuf::from("/rscratch/phj/data/ilsvrc2012_scale480_orig_v2a/ilsvrc2012_scale480_train_data.varraydb"),
-    train_labels_path:    PathBuf::from("/rscratch/phj/data/ilsvrc2012_scale480_orig_v2a/ilsvrc2012_scale480_train_labels.varraydb"),
+    train_data_path:      PathBuf::from("/rscratch/phj/data/ilsvrc2012_scale480_orig_test/ilsvrc2012_scale480_train_data.varraydb"),
+    train_labels_path:    PathBuf::from("/rscratch/phj/data/ilsvrc2012_scale480_orig_test/ilsvrc2012_scale480_train_labels.varraydb"),
+    //train_data_path:      PathBuf::from("/rscratch/phj/data/ilsvrc2012_noscale_orig_v2a/ilsvrc2012_scale480_train_data.varraydb"),
+    //train_labels_path:    PathBuf::from("/rscratch/phj/data/ilsvrc2012_noscale_orig_v2a/ilsvrc2012_scale480_train_labels.varraydb"),
+    //train_data_path:      PathBuf::from("/rscratch/phj/data/ilsvrc2012_noscale_orig_v2a/ilsvrc2012_scale480_valid_data.varraydb"),
+    //train_labels_path:    PathBuf::from("/rscratch/phj/data/ilsvrc2012_noscale_orig_v2a/ilsvrc2012_scale480_valid_labels.varraydb"),
   };
 
   preproc_archive(&config);

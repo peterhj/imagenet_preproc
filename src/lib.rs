@@ -1,4 +1,5 @@
 extern crate varraydb;
+extern crate vips;
 
 extern crate byteorder;
 //extern crate chan;
@@ -24,6 +25,7 @@ use memmap::{Mmap, Protection};
 use tar::{Archive};
 use threadpool::{ThreadPool};
 use varraydb::{VarrayDb};
+use vips::{Vips, VipsImageFormat, VipsImage};
 
 use rand::{Rng, thread_rng};
 use std::cmp::{min};
@@ -45,7 +47,7 @@ pub struct IlsvrcConfig {
   pub valid_archive_path:   PathBuf,
   pub valid_rawcats_path:   PathBuf,
 
-  pub resize_smaller_dim:   u32,
+  pub resize_smaller_dim:   Option<u32>,
   pub keep_aspect_ratio:    bool,
 
   pub train_data_path:      PathBuf,
@@ -186,6 +188,43 @@ impl MagickEncoderWorker {
   }
 }*/
 
+struct VipsEncoderWorker {
+  config:       IlsvrcConfig,
+  encoder_rx:   Receiver<EncoderMsg>,
+  writer_tx:    SyncSender<WriterMsg>,
+}
+
+impl VipsEncoderWorker {
+  pub fn run(&mut self) {
+    let _vips = Vips::new();
+    loop {
+      match self.encoder_rx.recv() {
+        Err(_) => {
+          break;
+        }
+
+        Ok(EncoderMsg::Quit) => {
+          self.writer_tx.send(
+              WriterMsg::Quit,
+          ).unwrap();
+          break;
+        }
+
+        Ok(EncoderMsg::RawImageFile(idx, rawcat, buf)) => {
+          let buf = buf.to_vec();
+          let image = match VipsImage::decode(buf) {
+            Err(e) => {
+              println!("WARNING: vips decode error: {}", idx);
+              continue;
+            }
+            Ok(im) => im,
+          };
+        }
+      }
+    }
+  }
+}
+
 struct PistonEncoderWorker {
   config:       IlsvrcConfig,
   encoder_rx:   Receiver<EncoderMsg>,
@@ -243,11 +282,16 @@ impl PistonEncoderWorker {
           }
           if image.is_none() {
             println!("WARNING: decoding failed: {}", idx);
+            {
+              let mut debug_file = File::create(&PathBuf::from(&format!("imagenet_{}.jpg", idx))).unwrap();
+              debug_file.write_all(&buf).unwrap();
+            }
             self.writer_tx.send(
                 WriterMsg::Skip(idx),
             ).unwrap();
             continue;
           }
+          continue; // FIXME(20160503): for debugging.
 
           let image = image.unwrap();
           let image_dims = image.dimensions();
@@ -256,39 +300,48 @@ impl PistonEncoderWorker {
 
           let mut is_new = false;
           let mut encoded_image = vec![];
-          if min_side <= self.config.resize_smaller_dim {
-            /*let image_buf = match image.as_rgb8() {
-              Some(buf) => buf.clone(),
-              None => panic!("failed to interpret image as rgb8"),
-            };*/
+          if let Some(resize_smaller_dim) = self.config.resize_smaller_dim {
+            if min_side <= resize_smaller_dim {
+              /*let image_buf = match image.as_rgb8() {
+                Some(buf) => buf.clone(),
+                None => panic!("failed to interpret image as rgb8"),
+              };*/
+              let image_buf = image.to_rgb();
+              let image = DynamicImage::ImageRgb8(image_buf);
+              match image.save(&mut encoded_image, ImageFormat::PNG) {
+                Err(e) => panic!("failed to encode old image as png: {:?}", e),
+                Ok(_) => {}
+              }
+            } else {
+              is_new = true;
+
+              let (old_width, old_height) = image_dims;
+              let (new_width, new_height) = if old_width < old_height {
+                (min_side, (min_side as f32 / old_width as f32 * old_height as f32).round() as u32)
+              } else if old_width > old_height {
+                ((min_side as f32 / old_height as f32 * old_width as f32).round() as u32, min_side)
+              } else {
+                (min_side, min_side)
+              };
+
+              /*let old_image_buf = match image.as_rgb8() {
+                Some(buf) => buf.clone(),
+                None => panic!("failed to interpret image as rgb8"),
+              };*/
+              let old_image_buf = image.to_rgb();
+              let new_image_buf = resize(&old_image_buf, new_width as u32, new_height as u32, FilterType::Lanczos3);
+
+              let new_image = DynamicImage::ImageRgb8(new_image_buf);
+              match new_image.save(&mut encoded_image, ImageFormat::PNG) {
+                Err(e) => panic!("failed to encode new image as png: {:?}", e),
+                Ok(_) => {}
+              }
+            }
+          } else {
             let image_buf = image.to_rgb();
             let image = DynamicImage::ImageRgb8(image_buf);
             match image.save(&mut encoded_image, ImageFormat::PNG) {
               Err(e) => panic!("failed to encode old image as png: {:?}", e),
-              Ok(_) => {}
-            }
-          } else {
-            is_new = true;
-
-            let (old_width, old_height) = image_dims;
-            let (new_width, new_height) = if old_width < old_height {
-              (min_side, (min_side as f32 / old_width as f32 * old_height as f32).round() as u32)
-            } else if old_width > old_height {
-              ((min_side as f32 / old_height as f32 * old_width as f32).round() as u32, min_side)
-            } else {
-              (min_side, min_side)
-            };
-
-            /*let old_image_buf = match image.as_rgb8() {
-              Some(buf) => buf.clone(),
-              None => panic!("failed to interpret image as rgb8"),
-            };*/
-            let old_image_buf = image.to_rgb();
-            let new_image_buf = resize(&old_image_buf, new_width as u32, new_height as u32, FilterType::Lanczos3);
-
-            let new_image = DynamicImage::ImageRgb8(new_image_buf);
-            match new_image.save(&mut encoded_image, ImageFormat::PNG) {
-              Err(e) => panic!("failed to encode new image as png: {:?}", e),
               Ok(_) => {}
             }
           }
@@ -468,7 +521,8 @@ pub fn preproc_archive(config: &IlsvrcConfig) {
     let encoder_rx = encoder_rxs[i].take().unwrap();
     let writer_tx = writer_tx.clone();
     encoder_pool.execute(move || {
-      PistonEncoderWorker{
+      //PistonEncoderWorker{
+      VipsEncoderWorker{
         config:     config,
         encoder_rx: encoder_rx,
         writer_tx:  writer_tx,
