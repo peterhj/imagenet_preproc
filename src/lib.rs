@@ -1,5 +1,9 @@
+extern crate array_cuda;
+extern crate array_new;
+extern crate epeg;
+extern crate rembrandt_kernels;
 extern crate varraydb;
-extern crate vips;
+//extern crate vips;
 
 extern crate byteorder;
 //extern crate chan;
@@ -7,6 +11,9 @@ extern crate csv;
 extern crate image;
 //extern crate magick;
 extern crate memmap;
+extern crate sdl2;
+extern crate sdl2_image;
+extern crate stb_image;
 extern crate tar;
 extern crate threadpool;
 
@@ -14,31 +21,44 @@ extern crate rand;
 extern crate rustc_serialize;
 extern crate time;
 
+use array_cuda::device::context::{DeviceContext};
+use array_cuda::device::memory::{DeviceZeroExt, DeviceBuffer};
+use array_new::{ArrayZeroExt, NdArraySerialize, Array3d};
+use rembrandt_kernels::ffi::*;
+use varraydb::{VarrayDb};
+
 use byteorder::{WriteBytesExt, LittleEndian};
 use csv::{Reader as CsvReader};
+use epeg::{EpegImage};
 use image::{GenericImage, ImageBuffer, Rgb, ColorType, ImageDecoder, DecodingResult};
 use image::{DynamicImage, ImageFormat, load};
 use image::imageops::{FilterType, resize};
 //use image::jpeg::{JPEGDecoder};
 //use magick::{MagickWand, FilterType as MagickFilterType};
 use memmap::{Mmap, Protection};
+use sdl2::rect::{Rect};
+use sdl2::pixels::{PixelFormatEnum};
+use sdl2::rwops::{RWops};
+use sdl2::surface::{Surface};
+use sdl2_image::{ImageRWops, SaveSurface};
+use stb_image::image::{Image, LoadResult, load_from_memory};
 use tar::{Archive};
 use threadpool::{ThreadPool};
-use varraydb::{VarrayDb};
-use vips::{Vips, VipsImageFormat, VipsImage};
+//use vips::{Vips, VipsImageFormat, VipsImage};
 
 use rand::{Rng, thread_rng};
 use std::cmp::{min};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{File};
-use std::io::{Read, Seek, Write, Cursor};
+use std::fs::{File, create_dir_all};
+use std::io::{Read, BufRead, Seek, Write, BufReader, Cursor};
+use std::iter::{repeat};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::sync::mpsc::{SyncSender, Receiver, sync_channel};
 use std::thread::{spawn};
 use time::{get_time};
 
-const NUM_ENCODERS: usize = 8;
+const NUM_ENCODERS: usize = 6;
 
 #[derive(Clone, Debug)]
 pub struct IlsvrcConfig {
@@ -52,6 +72,8 @@ pub struct IlsvrcConfig {
 
   pub train_data_path:      PathBuf,
   pub train_labels_path:    PathBuf,
+  pub valid_data_path:      PathBuf,
+  pub valid_labels_path:    PathBuf,
 }
 
 #[derive(RustcDecodable)]
@@ -119,7 +141,64 @@ impl ReaderWorker {
       println!("DEBUG: processed: {} elapsed: {:.3}", counter, elapsed);
     }
     for enc_idx in 0 .. NUM_ENCODERS {
+      self.encoder_txs[enc_idx].send(
+          EncoderMsg::Quit,
+      ).unwrap();
+    }
+  }
+}
+
+struct ValidReaderWorker {
+  config:       IlsvrcConfig,
+  encoder_txs:  Vec<SyncSender<EncoderMsg>>,
+  valid_rawcats:    Vec<i32>,
+  //wnid_to_rawcats:  HashMap<String, i32>,
+  //archive_file:     File,
+  //archive_map:      Mmap,
+}
+
+impl ValidReaderWorker {
+  pub fn run(&mut self, archive_map: Mmap) {
+    let mut reader = Cursor::new(unsafe { archive_map.as_slice() });
+    let mut archive = Archive::new(reader);
+    let mut counter = 0;
+    let start_time = get_time();
+    for (k, im_file) in archive.entries().unwrap().enumerate() {
+      let mut im_file = im_file.unwrap();
+
+      let im_path = im_file.header().path().unwrap().into_owned();
+      let im_path_toks: Vec<_> = im_path.to_str().unwrap().splitn(2, ".").collect();
+      let im_stem_toks: Vec<_> = im_path_toks[0].splitn(3, "_").collect();
+      let idx: usize = im_stem_toks[2].parse().unwrap();
+      assert!(idx >= 1);
+      assert!(idx <= 50_000);
+
+      let rawcat = self.valid_rawcats[idx-1];
+      let label_cat = rawcat - 1;
+      assert!(label_cat >= 0 && label_cat < 1000);
+      let mut label_buf = vec![];
+      label_buf.write_i32::<LittleEndian>(label_cat).unwrap();
+      assert_eq!(4, label_buf.len());
+
+      let mut buf: Vec<u8> = vec![];
+      match im_file.read_to_end(&mut buf) {
+        Err(e) => panic!("failed to read image: {} {:?}", k, e),
+        Ok(_) => {}
+      }
+
       self.encoder_txs[counter % NUM_ENCODERS].send(
+          EncoderMsg::RawImageFile(counter, rawcat, buf),
+      ).unwrap();
+      counter += 1;
+
+      if (k+1) % 100 == 0 {
+        let lap_time = get_time();
+        let elapsed = (lap_time - start_time).num_milliseconds() as f32 * 0.001;
+        println!("DEBUG: processed: {} elapsed: {:.3}", counter, elapsed);
+      }
+    }
+    for enc_idx in 0 .. NUM_ENCODERS {
+      self.encoder_txs[enc_idx].send(
           EncoderMsg::Quit,
       ).unwrap();
     }
@@ -188,15 +267,541 @@ impl MagickEncoderWorker {
   }
 }*/
 
-struct VipsEncoderWorker {
+struct ValidStbEncoderWorker {
   config:       IlsvrcConfig,
   encoder_rx:   Receiver<EncoderMsg>,
   writer_tx:    SyncSender<WriterMsg>,
 }
 
-impl VipsEncoderWorker {
+impl ValidStbEncoderWorker {
+  pub fn run(&mut self, dev_idx: usize) {
+    let context = DeviceContext::new(dev_idx);
+    let ctx = &context.as_ref();
+    // XXX(20160505): this takes about 9 GB; yes, some images are large.
+    let mut resize_src_buf = DeviceBuffer::<f32>::zeros(384 * 1024 * 1024 * 3, ctx);
+    let mut resize_dst_buf = DeviceBuffer::<f32>::zeros(384 * 1024 * 1024 * 3, ctx);
+
+    loop {
+      match self.encoder_rx.recv() {
+        Err(_) => {
+          break;
+        }
+
+        Ok(EncoderMsg::Quit) => {
+          break;
+        }
+
+        Ok(EncoderMsg::RawImageFile(idx, rawcat, buf)) => {
+          let top_10k = if idx < 10000 {
+            0
+          } else if idx < 20000 {
+            1
+          } else if idx < 30000 {
+            2
+          } else if idx < 40000 {
+            3
+          } else if idx < 50000 {
+            4
+          } else {
+            unreachable!();
+          };
+          let image_arr = match load_from_memory(&buf) {
+            LoadResult::Error(e) => {
+              println!("WARNING: stb failed to load image: {} {:?}", idx, e);
+              let im_arr = Array3d::<u8>::zeros((256, 256, 3));
+              im_arr
+            }
+            LoadResult::ImageU8(mut im) => {
+              //assert_eq!(3, im.depth);
+              if im.depth != 3 && im.depth != 1 {
+                panic!("WARNING: stb loaded an unsupported depth: {} {}", idx, im.depth);
+              }
+              assert_eq!(im.depth * im.width * im.height, im.data.len());
+
+              if im.depth == 1 {
+                let mut rgb_data = Vec::with_capacity(3 * im.width * im.height);
+                assert_eq!(im.width * im.height, im.data.len());
+                for i in 0 .. im.data.len() {
+                  rgb_data.push(im.data[i]);
+                  rgb_data.push(im.data[i]);
+                  rgb_data.push(im.data[i]);
+                }
+                assert_eq!(3 * im.width * im.height, rgb_data.len());
+                im = Image::new(im.width, im.height, 3, rgb_data);
+              }
+              assert_eq!(3, im.depth);
+
+              {
+                let buf = match im.write_png() {
+                  Err(e) => panic!("stb failed to write png: {} {:?}", idx, e),
+                  Ok(buf) => buf,
+                };
+                let orig_path = PathBuf::from(&format!("tmp/preproc_debug/{}/valid_{}_orig.png", top_10k, idx));
+                let mut orig_file = File::create(&orig_path).unwrap();
+                orig_file.write_all(&buf).unwrap();
+              }
+
+              let orig_w = im.width;
+              let orig_h = im.height;
+              let min_dim = min(orig_w, orig_h);
+              if min_dim != 256 {
+                let (new_w, new_h) = if min_dim == orig_w {
+                  (256, (256 as f32 / orig_w as f32 * orig_h as f32).round() as usize)
+                } else {
+                  ((256 as f32 / orig_h as f32 * orig_w as f32).round() as usize, 256)
+                };
+
+                let mut src_buf_h = Vec::with_capacity(3 * im.width * im.height);
+                for c in 0 .. 3 {
+                  for y in 0 .. im.height {
+                    for x in 0 .. im.width {
+                      src_buf_h.push(im.data[c + x * 3 + y * 3 * im.width] as f32 / 255.0);
+                    }
+                  }
+                }
+
+                resize_src_buf.as_ref_mut_range(0, orig_w * orig_h * 3, ctx)
+                  .sync_load(&src_buf_h);
+
+                unsafe { rembrandt_kernel_image3_bicubic_scale(
+                    resize_src_buf.as_ref(ctx).as_ptr(),
+                    orig_w as i32, orig_h as i32, 3,
+                    resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
+                    new_w as i32, new_h as i32,
+                    ctx.stream.ptr,
+                ) };
+
+                let mut dst_buf_h = Vec::with_capacity(new_w * new_h * 3);
+                for _ in 0 .. 3 * new_w * new_h {
+                  dst_buf_h.push(0.0);
+                }
+
+                resize_dst_buf.as_ref_range(0, new_w * new_h * 3, ctx)
+                  .sync_store(&mut dst_buf_h);
+
+                let mut resize_im = Image::new(new_w, new_h, 3, repeat(0).take(new_w * new_h * 3).collect());
+                for y in 0 .. new_h {
+                  for x in 0 .. new_w {
+                    for c in 0 .. 3 {
+                      resize_im.data[c + x * 3 + y * 3 * new_w]
+                          = (dst_buf_h[x + y * new_w + c * new_w * new_h] * 255.0).max(0.0).min(255.0).round() as u8;
+                    }
+                  }
+                }
+
+                {
+                  let buf = match resize_im.write_png() {
+                    Err(e) => panic!("stb failed to write png: {} {:?}", idx, e),
+                    Ok(buf) => buf,
+                  };
+                  let resize_path = PathBuf::from(&format!("tmp/preproc_debug/{}/valid_{}_resize.png", top_10k, idx));
+                  let mut resize_file = File::create(&resize_path).unwrap();
+                  resize_file.write_all(&buf).unwrap();
+                }
+
+                /*match im.resize(&mut resize_im) {
+                  Err(e) => {
+                    println!("WARNING: stb failed to resize image: {} {:?}", k, e);
+                    continue;
+                  }
+                  Ok(_) => {}
+                }*/
+
+                im = resize_im;
+              }
+
+              let mut trans_data = Vec::with_capacity(3 * im.width * im.height);
+              for c in 0 .. 3 {
+                for y in 0 .. im.height {
+                  for x in 0 .. im.width {
+                    trans_data.push(im.data[c + x * 3 + y * 3 * im.width]);
+                  }
+                }
+              }
+              assert_eq!(im.depth * im.width * im.height, trans_data.len());
+              let im_arr = Array3d::<u8>::with_data(trans_data, (im.width, im.height, 3));
+              im_arr
+            }
+            LoadResult::ImageF32(im) => {
+              panic!("WARNING: stb loaded a f32 image: {}", idx);
+            }
+          };
+
+          let mut encoded_arr = vec![];
+          match image_arr.serialize(&mut encoded_arr) {
+            Err(e) => panic!("array serialization error: {:?}", e),
+            Ok(_) => {}
+          }
+          self.writer_tx.send(
+              WriterMsg::ImageFile(idx, rawcat, encoded_arr),
+          ).unwrap();
+        }
+      }
+    }
+    self.writer_tx.send(
+        WriterMsg::Quit,
+    ).unwrap();
+  }
+}
+
+struct StbEncoderWorker {
+  config:       IlsvrcConfig,
+  encoder_rx:   Receiver<EncoderMsg>,
+  writer_tx:    SyncSender<WriterMsg>,
+}
+
+impl StbEncoderWorker {
+  pub fn run(&mut self, dev_idx: usize) {
+    let context = DeviceContext::new(dev_idx);
+    let ctx = &context.as_ref();
+    // XXX(20160505): this takes about 9 GB; yes, some images are large.
+    let mut resize_src_buf = DeviceBuffer::<f32>::zeros(384 * 1024 * 1024 * 3, ctx);
+    let mut resize_dst_buf = DeviceBuffer::<f32>::zeros(384 * 1024 * 1024 * 3, ctx);
+
+    let mut max_w = 0;
+    let mut max_h = 0;
+    let mut max_ratio = 1.0;
+    loop {
+      match self.encoder_rx.recv() {
+        Err(_) => {
+          break;
+        }
+
+        Ok(EncoderMsg::Quit) => {
+          break;
+        }
+
+        Ok(EncoderMsg::RawImageFile(idx, rawcat, buf)) => {
+          {
+            let mut image = match load_from_memory(&buf) {
+              LoadResult::Error(e) => {
+                println!("WARNING: stb failed to load jpg: {} {:?}", idx, e);
+                self.writer_tx.send(
+                    WriterMsg::Skip(idx),
+                ).unwrap();
+                continue;
+              }
+              LoadResult::ImageU8(mut im) => {
+                if im.depth != 3 && im.depth != 1 {
+                  println!("WARNING: stb loaded an unsupported depth: {} {}", idx, im.depth);
+                  self.writer_tx.send(
+                      WriterMsg::Skip(idx),
+                  ).unwrap();
+                  continue;
+                }
+                assert_eq!(im.depth * im.width * im.height, im.data.len());
+
+                if im.depth == 1 {
+                  let mut rgb_data = Vec::with_capacity(3 * im.width * im.height);
+                  assert_eq!(im.width * im.height, im.data.len());
+                  for i in 0 .. im.data.len() {
+                    rgb_data.push(im.data[i]);
+                    rgb_data.push(im.data[i]);
+                    rgb_data.push(im.data[i]);
+                  }
+                  assert_eq!(3 * im.width * im.height, rgb_data.len());
+                  im = Image::new(im.width, im.height, 3, rgb_data);
+                }
+                assert_eq!(3, im.depth);
+
+                im
+              }
+              LoadResult::ImageF32(im) => {
+                println!("WARNING: stb loaded a f32 image: {}", idx);
+                self.writer_tx.send(
+                    WriterMsg::Skip(idx),
+                ).unwrap();
+                continue;
+              }
+            };
+
+            let orig_w = image.width;
+            let orig_h = image.height;
+            //let orig_pitch = image.pitch();
+            if orig_w as f32 / orig_h as f32 > max_ratio {
+              max_ratio = orig_w as f32 / orig_h as f32;
+              println!("DEBUG: new max ratio: {} {:.3}", idx, max_ratio);
+            } else if orig_h as f32 / orig_w as f32 > max_ratio {
+              max_ratio = orig_h as f32 / orig_w as f32;
+              println!("DEBUG: new max ratio: {} {:.3}", idx, max_ratio);
+            }
+            if orig_w > max_w {
+              max_w = orig_w;
+              println!("DEBUG: new max width: {} {}", idx, max_w);
+            }
+            if orig_h > max_h {
+              max_h = orig_h;
+              println!("DEBUG: new max width: {} {}", idx, max_h);
+            }
+
+            let min_dim = min(orig_w, orig_h);
+
+            let encoded_buf = if min_dim <= 480 {
+              buf
+
+            } else {
+              let (new_w, new_h) = if min_dim == orig_w {
+                (480, (480 as f32 / orig_w as f32 * orig_h as f32).round() as usize)
+              } else {
+                ((480 as f32 / orig_h as f32 * orig_w as f32).round() as usize, 480)
+              };
+
+              let mut src_buf_h = Vec::with_capacity(3 * image.width * image.height);
+              for c in 0 .. 3 {
+                for y in 0 .. image.height {
+                  for x in 0 .. image.width {
+                    src_buf_h.push(image.data[c + x * 3 + y * 3 * image.width] as f32 / 255.0);
+                  }
+                }
+              }
+
+              resize_src_buf.as_ref_mut_range(0, orig_w * orig_h * 3, ctx)
+                .sync_load(&src_buf_h);
+
+              unsafe { rembrandt_kernel_image3_bicubic_scale(
+                  resize_src_buf.as_ref(ctx).as_ptr(),
+                  orig_w as i32, orig_h as i32, 3,
+                  resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
+                  new_w as i32, new_h as i32,
+                  ctx.stream.ptr,
+              ) };
+
+              let mut dst_buf_h = Vec::with_capacity(new_w * new_h * 3);
+              for _ in 0 .. 3 * new_w * new_h {
+                dst_buf_h.push(0.0);
+              }
+
+              resize_dst_buf.as_ref_range(0, new_w * new_h * 3, ctx)
+                .sync_store(&mut dst_buf_h);
+
+              let mut resize_image = Image::new(new_w, new_h, 3, repeat(0).take(new_w * new_h * 3).collect());
+              for y in 0 .. new_h {
+                for x in 0 .. new_w {
+                  for c in 0 .. 3 {
+                    resize_image.data[c + x * 3 + y * 3 * new_w]
+                        = (dst_buf_h[x + y * new_w + c * new_w * new_h] * 255.0).max(0.0).min(255.0).round() as u8;
+                  }
+                }
+              }
+
+              // FIXME(20160505): encode resized image as PNG.
+              let mut resize_imagebuf = match ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(new_w as u32, new_h as u32, resize_image.data) {
+                None => {
+                  println!("WARNING: failed to make piston imagebuffer from raw bytes: {}", idx);
+                  self.writer_tx.send(
+                      WriterMsg::Skip(idx),
+                  ).unwrap();
+                  continue;
+                }
+                Some(imagebuf) => imagebuf,
+              };
+
+              let mut encoded_buf = vec![];
+              let dynimage = DynamicImage::ImageRgb8(resize_imagebuf);
+              match dynimage.save(&mut encoded_buf, ImageFormat::JPEG) {
+                Err(e) => {
+                  println!("WARNING: failed to encode old image as jpg: {} {:?}", idx, e);
+                  self.writer_tx.send(
+                      WriterMsg::Skip(idx),
+                  ).unwrap();
+                  continue;
+                }
+                Ok(_) => {}
+              }
+
+              {
+                let div_10k = idx / 10000;
+                let dump_dir = PathBuf::from(&format!("tmp/preproc_train_debug/{}", div_10k));
+                create_dir_all(&dump_dir).ok();
+                //let resize_path = PathBuf::from(&format!("tmp/preproc_train_debug/{}/valid_{}_resize.png", div_10k, idx));
+
+                let mut orig_path = dump_dir.clone();
+                orig_path.push(&format!("train_{}_orig.jpg", idx));
+                let mut orig_file = File::create(&orig_path).unwrap();
+                orig_file.write_all(&buf).unwrap();
+
+                let mut resize_path = dump_dir.clone();
+                resize_path.push(&format!("train_{}_resize.jpg", idx));
+                let mut resize_file = File::create(&resize_path).unwrap();
+                resize_file.write_all(&encoded_buf).unwrap();
+              }
+
+              {
+                let mut test_reader = Cursor::new(&encoded_buf);
+                match load(test_reader, ImageFormat::JPEG) {
+                  Err(e) => {
+                    println!("WARNING: failed to decode the encoded image as jpg: {} {:?}", idx, e);
+                    self.writer_tx.send(
+                        WriterMsg::Skip(idx),
+                    ).unwrap();
+                    continue;
+                  }
+                  Ok(_) => {}
+                }
+              }
+
+              {
+                let mut test_image = match load_from_memory(&encoded_buf) {
+                  LoadResult::ImageU8(im) => im,
+                  _ => {
+                    println!("WARNING: failed to decode the encoded image as jpg (stb): {}", idx);
+                    self.writer_tx.send(
+                        WriterMsg::Skip(idx),
+                    ).unwrap();
+                    continue;
+                  }
+                };
+                assert_eq!(new_w, test_image.width);
+                assert_eq!(new_h, test_image.height);
+                assert_eq!(3, test_image.depth);
+              }
+
+              encoded_buf
+            };
+
+            self.writer_tx.send(
+                WriterMsg::ImageFile(idx, rawcat, encoded_buf),
+            ).unwrap();
+          }
+        }
+      }
+    }
+    println!("DEBUG: encoder: max_w: {} max_h: {} max_ratio: {:.3}", max_w, max_h, max_ratio);
+    self.writer_tx.send(
+        WriterMsg::Quit,
+    ).unwrap();
+  }
+}
+
+struct SdlEncoderWorker {
+  config:       IlsvrcConfig,
+  encoder_rx:   Receiver<EncoderMsg>,
+  writer_tx:    SyncSender<WriterMsg>,
+}
+
+impl SdlEncoderWorker {
   pub fn run(&mut self) {
-    let _vips = Vips::new();
+    let template_surf = match Surface::new(480, 480, PixelFormatEnum::RGB888) {
+      Err(e) => panic!("failed to make template surface"),
+      Ok(surf) => surf,
+    };
+    let mut max_w = 0;
+    let mut max_h = 0;
+    let mut max_ratio = 1.0;
+    loop {
+      match self.encoder_rx.recv() {
+        Err(_) => {
+          break;
+        }
+
+        Ok(EncoderMsg::Quit) => {
+          /*self.writer_tx.send(
+              WriterMsg::Quit,
+          ).unwrap();*/
+          break;
+        }
+
+        Ok(EncoderMsg::RawImageFile(idx, rawcat, buf)) => {
+          /*if idx < 100 {
+            let mut debug_file = File::create(&PathBuf::from(&format!("tmp/imagenet_{}.jpg", idx))).unwrap();
+            debug_file.write_all(&buf).unwrap();
+          }*/
+          {
+            let rw = match RWops::from_bytes(&buf) {
+              Err(e) => {
+                println!("WARNING: sdl rwops error: {} {:?}", idx, e);
+                self.writer_tx.send(
+                    WriterMsg::Skip(idx),
+                ).unwrap();
+                continue;
+              }
+              Ok(rw) => rw,
+            };
+            let image_surf = match rw.load_jpg() {
+              Err(e) => {
+                println!("WARNING: sdl decode error: {} {:?}", idx, e);
+                self.writer_tx.send(
+                    WriterMsg::Skip(idx),
+                ).unwrap();
+                continue;
+              }
+              Ok(surf) => surf,
+            };
+            //let (orig_w, orig_h) = image.get_size();
+            let orig_w = image_surf.width();
+            let orig_h = image_surf.height();
+            let orig_pitch = image_surf.pitch();
+            if orig_w as f32 / orig_h as f32 > max_ratio {
+              max_ratio = orig_w as f32 / orig_h as f32;
+              println!("DEBUG: new max ratio: {} {:.3}", idx, max_ratio);
+            } else if orig_h as f32 / orig_w as f32 > max_ratio {
+              max_ratio = orig_h as f32 / orig_w as f32;
+              println!("DEBUG: new max ratio: {} {:.3}", idx, max_ratio);
+            }
+            if orig_w > max_w {
+              max_w = orig_w;
+              println!("DEBUG: new max width: {} {}", idx, max_w);
+            }
+            if orig_h > max_h {
+              max_h = orig_h;
+              println!("DEBUG: new max width: {} {}", idx, max_h);
+            }
+
+            let mut target_surf = match Surface::new(orig_w, orig_h, PixelFormatEnum::RGB888) {
+              Err(e) => {
+                println!("WARNING: failed to create target surface: {} {:?}", idx, e);
+                self.writer_tx.send(
+                    WriterMsg::Skip(idx),
+                ).unwrap();
+                continue;
+              }
+              Ok(surf) => surf,
+            };
+            match image_surf.blit(None, &mut target_surf, None) {
+              Err(e) => {
+                println!("WARNING: failed to blit: {} {:?}", idx, e);
+                self.writer_tx.send(
+                    WriterMsg::Skip(idx),
+                ).unwrap();
+              }
+              Ok(_) => {}
+            }
+
+            if target_surf.must_lock() {
+              target_surf.with_lock(|pixels| {
+              });
+            } else {
+              target_surf.without_lock().map(|pixels| {
+              }).unwrap();
+            }
+
+            let min_dim = min(orig_w, orig_h);
+
+            // TODO
+          }
+
+          self.writer_tx.send(
+              WriterMsg::ImageFile(idx, rawcat, buf),
+          ).unwrap();
+        }
+      }
+    }
+    println!("DEBUG: encoder: max_w: {} max_h: {} max_ratio: {:.3}", max_w, max_h, max_ratio);
+    self.writer_tx.send(
+        WriterMsg::Quit,
+    ).unwrap();
+  }
+}
+
+struct EpegEncoderWorker {
+  config:       IlsvrcConfig,
+  encoder_rx:   Receiver<EncoderMsg>,
+  writer_tx:    SyncSender<WriterMsg>,
+}
+
+impl EpegEncoderWorker {
+  pub fn run(&mut self) {
+    //let _vips = Vips::new();
     loop {
       match self.encoder_rx.recv() {
         Err(_) => {
@@ -211,7 +816,76 @@ impl VipsEncoderWorker {
         }
 
         Ok(EncoderMsg::RawImageFile(idx, rawcat, buf)) => {
-          let buf = buf.to_vec();
+          /*if idx < 100 {
+            let mut debug_file = File::create(&PathBuf::from(&format!("tmp/imagenet_{}.jpg", idx))).unwrap();
+            debug_file.write_all(&buf).unwrap();
+          }*/
+          let mut image = match EpegImage::open_memory(buf.clone()) {
+            Err(e) => {
+              println!("WARNING: epeg decode error: {}", idx);
+              self.writer_tx.send(
+                  WriterMsg::Skip(idx),
+              ).unwrap();
+              continue;
+            }
+            Ok(im) => im,
+          };
+          let (orig_w, orig_h) = image.get_size();
+          let min_dim = min(orig_w, orig_h);
+          let (new_w, new_h) = if min_dim == orig_w {
+            (480, (480 as f32 / orig_w as f32 * orig_h as f32).round() as usize)
+          } else {
+            ((480 as f32 / orig_w as f32 * orig_w as f32).round() as usize, 480)
+          };
+          image.set_decode_size(new_w, new_h);
+          let mut out_buf = Vec::with_capacity(3 * new_w * new_h);
+          unsafe { out_buf.set_len(3 * new_w * new_h) };
+          match image.scale_to_memory(&mut out_buf) {
+            Err(e) => {
+              println!("WARNING: epeg scale error: {:?}", e);
+              self.writer_tx.send(
+                  WriterMsg::Skip(idx),
+              ).unwrap();
+              continue;
+            }
+            Ok(_) => {}
+          }
+          self.writer_tx.send(
+              WriterMsg::ImageFile(idx, rawcat, buf),
+          ).unwrap();
+        }
+      }
+    }
+  }
+}
+
+/*struct VipsEncoderWorker {
+  config:       IlsvrcConfig,
+  encoder_rx:   Receiver<EncoderMsg>,
+  writer_tx:    SyncSender<WriterMsg>,
+}
+
+impl VipsEncoderWorker {
+  pub fn run(&mut self) {
+    loop {
+      match self.encoder_rx.recv() {
+        Err(_) => {
+          break;
+        }
+
+        Ok(EncoderMsg::Quit) => {
+          self.writer_tx.send(
+              WriterMsg::Quit,
+          ).unwrap();
+          break;
+        }
+
+        Ok(EncoderMsg::RawImageFile(idx, rawcat, buf)) => {
+          {
+            let mut debug_file = File::create(&PathBuf::from(&format!("tmp/imagenet_{}.jpg", idx))).unwrap();
+            debug_file.write_all(&buf).unwrap();
+          }
+          //let buf = buf.to_vec();
           let image = match VipsImage::decode(buf) {
             Err(e) => {
               println!("WARNING: vips decode error: {}", idx);
@@ -223,7 +897,7 @@ impl VipsEncoderWorker {
       }
     }
   }
-}
+}*/
 
 struct PistonEncoderWorker {
   config:       IlsvrcConfig,
@@ -457,141 +1131,477 @@ impl WriterWorker {
   }
 }
 
-pub fn preproc_archive(config: &IlsvrcConfig) {
-  let mut wnid_to_rawcats = HashMap::with_capacity(1000);
-  {
-    let mut reader = CsvReader::from_file(&config.wnid_to_rawcats_path).unwrap();
-    for record in reader.decode() {
-      let record: WnidRawCatRecord = record.unwrap();
-      wnid_to_rawcats.insert(record.wnid, record.raw_cat);
+struct ValidWriterWorker {
+  config:       IlsvrcConfig,
+  writer_rx:    Receiver<WriterMsg>,
+  counter:      usize,
+}
+
+impl ValidWriterWorker {
+  pub fn run(&mut self) {
+    let mut quit_count = 0;
+    //let mut adj_idx = 0;
+    let mut skip_set: HashSet<usize> = HashSet::new();
+    let mut cache: BTreeMap<usize, (Vec<u8>, Vec<u8>)> = BTreeMap::new();
+    //let mut data_db = VarrayDb::create(&self.config.train_data_path).unwrap();
+    //let mut labels_db = VarrayDb::create(&self.config.train_labels_path).unwrap();
+    let mut data_db = VarrayDb::create(&self.config.valid_data_path).unwrap();
+    let mut labels_db = VarrayDb::create(&self.config.valid_labels_path).unwrap();
+    loop {
+      match self.writer_rx.recv() {
+        Err(_) => {
+          break;
+        }
+
+        Ok(WriterMsg::Quit) => {
+          quit_count += 1;
+          if quit_count >= NUM_ENCODERS {
+            assert!(cache.is_empty());
+            println!("DEBUG: total number skipped: {}", skip_set.len());
+            break;
+          }
+        }
+
+        Ok(WriterMsg::Skip(idx)) => {
+          skip_set.insert(idx);
+          if idx == self.counter {
+            //adj_idx += 1;
+            self.counter += 1;
+          }
+          loop {
+            if cache.contains_key(&self.counter) {
+              let (buf, label_buf) = cache.remove(&self.counter).unwrap();
+              data_db.append(&buf);
+              labels_db.append(&label_buf);
+              self.counter += 1;
+            } else if skip_set.contains(&self.counter) {
+              //adj_idx += 1;
+              self.counter += 1;
+            } else {
+              break;
+            }
+          }
+        }
+
+        Ok(WriterMsg::ImageFile(idx, rawcat, buf)) => {
+          //println!("DEBUG: images writen: {}", self.counter);
+          let label_cat = rawcat - 1;
+          assert!(label_cat >= 0 && label_cat < 1000);
+          let mut label_buf = vec![];
+          label_buf.write_i32::<LittleEndian>(label_cat).unwrap();
+          assert_eq!(4, label_buf.len());
+
+          if idx == self.counter {
+            data_db.append(&buf);
+            labels_db.append(&label_buf);
+            self.counter += 1;
+          } else {
+            cache.insert(idx, (buf, label_buf));
+            loop {
+              if cache.contains_key(&self.counter) {
+                let (buf, label_buf) = cache.remove(&self.counter).unwrap();
+                data_db.append(&buf);
+                labels_db.append(&label_buf);
+                self.counter += 1;
+              } else if skip_set.contains(&self.counter) {
+                //adj_idx += 1;
+                self.counter += 1;
+              } else {
+                break;
+              }
+            }
+          }
+
+          /*if self.counter % 100 == 0 {
+            println!("DEBUG: images writen: {}", self.counter);
+          }*/
+        }
+      }
     }
   }
-  //println!("DEBUG: {:?}", wnid_to_rawcats);
+}
 
-  let archive_file = File::open(&config.train_archive_path).unwrap();
-  let archive_map = Mmap::open(&archive_file, Protection::Read).unwrap();
+impl IlsvrcConfig {
+//pub fn preproc_archive(config: &IlsvrcConfig) {
+  pub fn preproc_train_data(&self) {
+    let mut wnid_to_rawcats = HashMap::with_capacity(1000);
+    {
+      let mut reader = CsvReader::from_file(&self.wnid_to_rawcats_path).unwrap();
+      for record in reader.decode() {
+        let record: WnidRawCatRecord = record.unwrap();
+        wnid_to_rawcats.insert(record.wnid, record.raw_cat);
+      }
+    }
+    //println!("DEBUG: {:?}", wnid_to_rawcats);
 
-  let mut samples_count = 0;
-  {
-    //let train_archive_file = File::open(&config.train_archive_path).unwrap();
-    //let mut train_archive = Archive::new(train_archive_file);
-    let mut reader = Cursor::new(unsafe { archive_map.as_slice() });
-    let mut train_archive = Archive::new(reader);
-    for (wnid_idx, wnid_file) in train_archive.entries().unwrap().enumerate() {
-      let wnid_file = wnid_file.unwrap();
-      let wnid_path: PathBuf = wnid_file.header().path().unwrap().into_owned();
-      //println!("DEBUG: counting {} {:?}...", wnid_idx, wnid_path);
-      let mut wnid_archive = Archive::new(wnid_file);
-      for (im_idx, im_file) in wnid_archive.entries().unwrap().enumerate() {
+    let archive_file = File::open(&self.train_archive_path).unwrap();
+    let archive_map = Mmap::open(&archive_file, Protection::Read).unwrap();
+
+    let mut samples_count = 0;
+    {
+      //let train_archive_file = File::open(&self.train_archive_path).unwrap();
+      //let mut train_archive = Archive::new(train_archive_file);
+      let mut reader = Cursor::new(unsafe { archive_map.as_slice() });
+      let mut train_archive = Archive::new(reader);
+      for (wnid_idx, wnid_file) in train_archive.entries().unwrap().enumerate() {
+        let wnid_file = wnid_file.unwrap();
+        let wnid_path: PathBuf = wnid_file.header().path().unwrap().into_owned();
+        //println!("DEBUG: counting {} {:?}...", wnid_idx, wnid_path);
+        let mut wnid_archive = Archive::new(wnid_file);
+        for (im_idx, im_file) in wnid_archive.entries().unwrap().enumerate() {
+          let im_file = im_file.unwrap();
+          samples_count += 1;
+        }
+      }
+    }
+    println!("DEBUG: samples count: {}", samples_count);
+
+    //let mut shuffle_idxs: Vec<_> = (0 .. samples_count).collect();
+    //thread_rng().shuffle(&mut shuffle_idxs);
+
+    let mut encoder_txs = vec![];
+    let mut encoder_rxs = vec![];
+    for _ in 0 .. NUM_ENCODERS {
+      let (encoder_tx, encoder_rx) = sync_channel(128);
+      encoder_txs.push(encoder_tx);
+      encoder_rxs.push(Some(encoder_rx));
+    }
+    let (writer_tx, writer_rx) = sync_channel(128);
+
+    let reader_thr = {
+      let config = self.clone();
+      spawn(move || {
+        ReaderWorker{
+          config:       config,
+          encoder_txs:  encoder_txs,
+          wnid_to_rawcats:  wnid_to_rawcats,
+        }.run(archive_map);
+      })
+    };
+
+    //let _vips = Vips::new();
+    let encoder_barrier = Arc::new(Barrier::new(NUM_ENCODERS + 1));
+    let encoder_pool = ThreadPool::new(NUM_ENCODERS);
+    for i in 0 .. NUM_ENCODERS {
+      let encoder_barrier = encoder_barrier.clone();
+      let config = self.clone();
+      let encoder_rx = encoder_rxs[i].take().unwrap();
+      let writer_tx = writer_tx.clone();
+      encoder_pool.execute(move || {
+        //PistonEncoderWorker{
+        //VipsEncoderWorker{
+        //EpegEncoderWorker{
+        //SdlEncoderWorker{
+        StbEncoderWorker{
+          config:     config,
+          encoder_rx: encoder_rx,
+          writer_tx:  writer_tx,
+        }.run(i);
+        encoder_barrier.wait();
+      });
+    }
+
+    let writer_thr = {
+      let config = self.clone();
+      spawn(move || {
+        WriterWorker{
+          config:     config,
+          writer_rx:  writer_rx,
+          counter:    0,
+        }.run();
+      })
+    };
+
+    writer_thr.join();
+    encoder_barrier.wait();
+    reader_thr.join();
+  }
+
+  pub fn preproc_valid_data(&self) {
+    let mut valid_rawcats = Vec::with_capacity(50_000);
+    {
+      //let mut reader = CsvReader::from_file(&self.wnid_to_rawcats_path).unwrap();
+      let reader = BufReader::new(File::open(&self.valid_rawcats_path).unwrap());
+      for line in reader.lines() {
+        let line = line.unwrap();
+        let rawcat: i32 = line.parse().unwrap();
+        valid_rawcats.push(rawcat);
+      }
+    }
+    assert_eq!(50_000, valid_rawcats.len());
+
+    let archive_file = File::open(&self.valid_archive_path).unwrap();
+    let archive_map = Mmap::open(&archive_file, Protection::Read).unwrap();
+
+    let mut samples_count = 0;
+    {
+      let mut reader = Cursor::new(unsafe { archive_map.as_slice() });
+      let mut archive = Archive::new(reader);
+      for (im_idx, im_file) in archive.entries().unwrap().enumerate() {
         let im_file = im_file.unwrap();
         samples_count += 1;
       }
     }
-  }
-  println!("DEBUG: samples count: {}", samples_count);
+    println!("DEBUG: samples count: {}", samples_count);
+    assert_eq!(50_000, samples_count);
 
-  //let mut shuffle_idxs: Vec<_> = (0 .. samples_count).collect();
-  //thread_rng().shuffle(&mut shuffle_idxs);
+    let mut encoder_txs = vec![];
+    let mut encoder_rxs = vec![];
+    for _ in 0 .. NUM_ENCODERS {
+      let (encoder_tx, encoder_rx) = sync_channel(128);
+      encoder_txs.push(encoder_tx);
+      encoder_rxs.push(Some(encoder_rx));
+    }
+    let (writer_tx, writer_rx) = sync_channel(128);
 
-  let mut encoder_txs = vec![];
-  let mut encoder_rxs = vec![];
-  for _ in 0 .. NUM_ENCODERS {
-    let (encoder_tx, encoder_rx) = sync_channel(128);
-    encoder_txs.push(encoder_tx);
-    encoder_rxs.push(Some(encoder_rx));
-  }
-  let (writer_tx, writer_rx) = sync_channel(128);
+    let reader_thr = {
+      let config = self.clone();
+      spawn(move || {
+        ValidReaderWorker{
+          config:       config,
+          encoder_txs:  encoder_txs,
+          valid_rawcats:    valid_rawcats,
+        }.run(archive_map);
+      })
+    };
 
-  let reader_thr = {
-    let config = config.clone();
-    spawn(move || {
-      ReaderWorker{
-        config:       config,
-        encoder_txs:  encoder_txs,
-        wnid_to_rawcats:  wnid_to_rawcats,
-      }.run(archive_map);
-    })
-  };
+    let encoder_barrier = Arc::new(Barrier::new(NUM_ENCODERS + 1));
+    let encoder_pool = ThreadPool::new(NUM_ENCODERS);
+    for i in 0 .. NUM_ENCODERS {
+      let encoder_barrier = encoder_barrier.clone();
+      let config = self.clone();
+      let encoder_rx = encoder_rxs[i].take().unwrap();
+      let writer_tx = writer_tx.clone();
+      encoder_pool.execute(move || {
+        ValidStbEncoderWorker{
+          config:     config,
+          encoder_rx: encoder_rx,
+          writer_tx:  writer_tx,
+        }.run(i);
+        encoder_barrier.wait();
+      });
+    }
 
-  let encoder_barrier = Arc::new(Barrier::new(NUM_ENCODERS + 1));
-  let encoder_pool = ThreadPool::new(NUM_ENCODERS);
-  for i in 0 .. NUM_ENCODERS {
-    let encoder_barrier = encoder_barrier.clone();
-    let config = config.clone();
-    let encoder_rx = encoder_rxs[i].take().unwrap();
-    let writer_tx = writer_tx.clone();
-    encoder_pool.execute(move || {
-      //PistonEncoderWorker{
-      VipsEncoderWorker{
-        config:     config,
-        encoder_rx: encoder_rx,
-        writer_tx:  writer_tx,
-      }.run();
-      encoder_barrier.wait();
-    });
-  }
+    let writer_thr = {
+      let config = self.clone();
+      spawn(move || {
+        ValidWriterWorker{
+          config:     config,
+          writer_rx:  writer_rx,
+          counter:    0,
+        }.run();
+      })
+    };
 
-  let writer_thr = {
-    let config = config.clone();
-    spawn(move || {
-      WriterWorker{
-        config:     config,
-        writer_rx:  writer_rx,
-        counter:    0,
-      }.run();
-    })
-  };
+    writer_thr.join();
+    encoder_barrier.wait();
+    reader_thr.join();
 
-  writer_thr.join();
-  encoder_barrier.wait();
-  reader_thr.join();
+    /*let mut data_db = VarrayDb::create(&self.valid_data_path).unwrap();
+    let mut labels_db = VarrayDb::create(&self.valid_labels_path).unwrap();
 
-  /*let train_archive_file = File::open(&config.train_archive_path).unwrap();
-  let mut train_archive = Archive::new(train_archive_file);
-  for (wnid_idx, wnid_file) in train_archive.entries().unwrap().enumerate() {
-    let wnid_file = wnid_file.unwrap();
-    let wnid_path: PathBuf = wnid_file.header().path().unwrap().into_owned();
-    let mut wnid_archive = Archive::new(wnid_file);
-    println!("DEBUG: processing {} {:?}...", wnid_idx, wnid_path);
-    for (im_idx, im_file) in wnid_archive.entries().unwrap().enumerate() {
+    let context = DeviceContext::new(0);
+    let ctx = &context.as_ref();
+    let mut resize_src_buf = DeviceBuffer::<f32>::zeros(4096 * 4096 * 3, ctx);
+    let mut resize_dst_buf = DeviceBuffer::<f32>::zeros(4096 * 4096 * 3, ctx);
+
+    let mut reader = Cursor::new(unsafe { archive_map.as_slice() });
+    let mut archive = Archive::new(reader);
+    let mut counter = 0;
+    let start_time = get_time();
+    for (k, im_file) in archive.entries().unwrap().enumerate() {
       let mut im_file = im_file.unwrap();
 
       let im_path = im_file.header().path().unwrap().into_owned();
-      //let im_stem = im_path.file_stem().unwrap().to_str().unwrap();
       let im_path_toks: Vec<_> = im_path.to_str().unwrap().splitn(2, ".").collect();
-      let im_stem_toks: Vec<_> = im_path_toks[0].splitn(2, "_").collect();
-      if !wnid_to_rawcats.contains_key(im_stem_toks[0]) {
-        println!("WARNING: unknown key: {} {} {:?} {:?}", wnid_idx, im_idx, im_path, im_stem_toks);
-        continue;
-      }
+      let im_stem_toks: Vec<_> = im_path_toks[0].splitn(3, "_").collect();
+      let idx: usize = im_stem_toks[2].parse().unwrap();
+
+      let rawcat = valid_rawcats[idx-1];
+      let label_cat = rawcat - 1;
+      assert!(label_cat >= 0 && label_cat < 1000);
+      let mut label_buf = vec![];
+      label_buf.write_i32::<LittleEndian>(label_cat).unwrap();
+      assert_eq!(4, label_buf.len());
 
       let mut buf: Vec<u8> = vec![];
       match im_file.read_to_end(&mut buf) {
-        Err(e) => panic!("failed to read image: {:?}", e),
+        Err(e) => panic!("failed to read image: {} {:?}", k, e),
         Ok(_) => {}
       }
-      let mut reader = Cursor::new(&buf);
-      let mut image = None;
-      match load(reader, ImageFormat::JPEG) {
-        Err(_) => {}
-        Ok(im) => image = Some(im),
-      }
-      if image.is_none() {
-        let mut reader = Cursor::new(&buf);
-        match load(reader, ImageFormat::PNG) {
-          Err(_) => {}
-          Ok(im) => image = Some(im),
+
+      {
+        let image_arr = match load_from_memory(&buf) {
+          LoadResult::Error(e) => {
+            println!("WARNING: stb failed to load image: {} {:?}", k, e);
+            let im_arr = Array3d::<u8>::zeros((256, 256, 3));
+            im_arr
+          }
+          LoadResult::ImageU8(mut im) => {
+            //assert_eq!(3, im.depth);
+            if im.depth != 3 && im.depth != 1 {
+              println!("WARNING: stb loaded an unsupported depth: {} {}", k, im.depth);
+              continue;
+            }
+            assert_eq!(im.depth * im.width * im.height, im.data.len());
+
+            if im.depth == 1 {
+              let mut rgb_data = Vec::with_capacity(3 * im.width * im.height);
+              assert_eq!(im.width * im.height, im.data.len());
+              for i in 0 .. im.data.len() {
+                rgb_data.push(im.data[i]);
+                rgb_data.push(im.data[i]);
+                rgb_data.push(im.data[i]);
+              }
+              assert_eq!(3 * im.width * im.height, rgb_data.len());
+              im = Image::new(im.width, im.height, 3, rgb_data);
+            }
+            assert_eq!(3, im.depth);
+
+            {
+              let buf = match im.write_png() {
+                Err(e) => panic!("stb failed to write png: {} {:?}", k, e),
+                Ok(buf) => buf,
+              };
+              let orig_path = PathBuf::from(&format!("tmp/preproc_debug/valid_{}_orig.png", k));
+              let mut orig_file = File::create(&orig_path).unwrap();
+              orig_file.write_all(&buf).unwrap();
+            }
+
+            let orig_w = im.width;
+            let orig_h = im.height;
+            let min_dim = min(orig_w, orig_h);
+            if min_dim != 256 {
+              let (new_w, new_h) = if min_dim == orig_w {
+                (256, (256 as f32 / orig_w as f32 * orig_h as f32).round() as usize)
+              } else {
+                ((256 as f32 / orig_h as f32 * orig_w as f32).round() as usize, 256)
+              };
+
+              let mut src_buf_h = Vec::with_capacity(3 * im.width * im.height);
+              for c in 0 .. 3 {
+                for y in 0 .. im.height {
+                  for x in 0 .. im.width {
+                    src_buf_h.push(im.data[c + x * 3 + y * 3 * im.width] as f32 / 255.0);
+                  }
+                }
+              }
+
+              resize_src_buf.as_ref_mut_range(0, orig_w * orig_h * 3, ctx)
+                .sync_load(&src_buf_h);
+
+              unsafe { rembrandt_kernel_image3_bicubic_scale(
+                  resize_src_buf.as_ref(ctx).as_ptr(),
+                  orig_w as i32, orig_h as i32, 3,
+                  resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
+                  new_w as i32, new_h as i32,
+                  ctx.stream.ptr,
+              ) };
+
+              let mut dst_buf_h = Vec::with_capacity(new_w * new_h * 3);
+              for _ in 0 .. 3 * new_w * new_h {
+                dst_buf_h.push(0.0);
+              }
+
+              resize_dst_buf.as_ref_range(0, new_w * new_h * 3, ctx)
+                .sync_store(&mut dst_buf_h);
+
+              let mut resize_im = Image::new(new_w, new_h, 3, repeat(0).take(new_w * new_h * 3).collect());
+              for y in 0 .. new_h {
+                for x in 0 .. new_w {
+                  for c in 0 .. 3 {
+                    resize_im.data[c + x * 3 + y * 3 * new_w]
+                        = (dst_buf_h[x + y * new_w + c * new_w * new_h] * 255.0).max(0.0).min(255.0).round() as u8;
+                  }
+                }
+              }
+
+              {
+                let buf = match resize_im.write_png() {
+                  Err(e) => panic!("stb failed to write png: {} {:?}", k, e),
+                  Ok(buf) => buf,
+                };
+                let resize_path = PathBuf::from(&format!("tmp/preproc_debug/valid_{}_resize.png", k));
+                let mut resize_file = File::create(&resize_path).unwrap();
+                resize_file.write_all(&buf).unwrap();
+              }
+
+              /*match im.resize(&mut resize_im) {
+                Err(e) => {
+                  println!("WARNING: stb failed to resize image: {} {:?}", k, e);
+                  continue;
+                }
+                Ok(_) => {}
+              }*/
+
+              im = resize_im;
+            }
+
+            let mut trans_data = Vec::with_capacity(3 * im.width * im.height);
+            for c in 0 .. 3 {
+              for y in 0 .. im.height {
+                for x in 0 .. im.width {
+                  trans_data.push(im.data[c + x * 3 + y * 3 * im.width]);
+                }
+              }
+            }
+            assert_eq!(im.depth * im.width * im.height, trans_data.len());
+            let im_arr = Array3d::<u8>::with_data(trans_data, (im.width, im.height, 3));
+            im_arr
+          }
+          LoadResult::ImageF32(im) => {
+            println!("WARNING: stb loaded a f32 image: {}", k);
+            continue;
+          }
+        };
+
+        let mut encoded_arr = vec![];
+        match image_arr.serialize(&mut encoded_arr) {
+          Err(e) => panic!("array serialization error: {:?}", e),
+          Ok(_) => {}
         }
-      }
-      if image.is_none() {
-        println!("WARNING: decoding failed: {:?}", im_path);
-        continue;
+
+        data_db.append(&encoded_arr);
+        labels_db.append(&label_buf);
       }
 
-      let image = image.unwrap();
-      let image_dims = image.dimensions();
-      let min_dim = min(image_dims.0, image_dims.1);
-      println!("DEBUG: min dim: {} dims: {:?} path: {:?}", min_dim, image_dims, im_path);
+      /*{
+        let mut image = match EpegImage::open_memory(buf.clone()) {
+          Err(e) => {
+            panic!("WARNING: epeg decode error: {} {:?}", idx, e);
+          }
+          Ok(im) => im,
+        };
+        let (orig_w, orig_h) = image.get_size();
+        let min_dim = min(orig_w, orig_h);
+        let (new_w, new_h) = if min_dim == orig_w {
+          (256, (256 as f32 / orig_w as f32 * orig_h as f32).round() as usize)
+        } else {
+          ((256 as f32 / orig_w as f32 * orig_w as f32).round() as usize, 256)
+        };
+        image.set_decode_size(new_w, new_h);
+        //image.set_decode_yuv8();
+        image.set_decode_rgb8();
+        image.set_quality(100);
+        image.enable_thumbnail_comments(false);
+        match image.get_scaled_pixels(0, 0, new_w, new_h) {
+          Err(e) => {
+            println!("WARNING: epeg scale error: {} {} {:?}", k, idx, e);
+          }
+          Ok(_) => {}
+        }
+
+        data_db.append(&buf);
+        labels_db.append(&label_buf);
+      }*/
+
+      counter += 1;
+      if (k+1) % 500 == 0 {
+        println!("DEBUG: iteration: {} progress: {}", k+1, counter);
+      }
     }
-  }*/
+    let lap_time = get_time();
+    let elapsed = (lap_time - start_time).num_milliseconds() as f32 * 0.001;
+    println!("DEBUG: processed: {} elapsed: {:.3}", counter, elapsed);*/
+  }
 }

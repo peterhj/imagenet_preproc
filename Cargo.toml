@@ -8,8 +8,8 @@ name = "imagenet_preproc"
 path = "src/lib.rs"
 
 [[bin]]
-name = "preproc-archive"
-path = "tools/preproc-archive.rs"
+name = "preproc-ilsvrc"
+path = "tools/preproc-ilsvrc.rs"
 
 [dependencies]
 rand = "*"
@@ -22,8 +22,15 @@ csv = "*"
 image = { path = "../image" }
 #magick = { path = "../magick" }
 memmap = "*"
+sdl2 = { path = "../rust-sdl2" }
+sdl2_image = { path = "../rust-sdl2_image" }
+stb_image = { path = "../rust-stb-image" }
 tar = "*"
 threadpool = "*"
 
+array_cuda = { path = "../libarray_cuda" }
+array_new = { path = "../libarray_new" }
+epeg = { path = "../libepeg" }
+rembrandt_kernels = { path = "../rembrandt_kernels" }
 varraydb = { path = "../varraydb" }
-vips = { path = "../libvips" }
+#vips = { path = "../libvips" }
