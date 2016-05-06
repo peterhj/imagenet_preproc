@@ -32,5 +32,6 @@ array_cuda = { path = "../libarray_cuda" }
 array_new = { path = "../libarray_new" }
 epeg = { path = "../libepeg" }
 rembrandt_kernels = { path = "../rembrandt_kernels" }
+turbojpeg = { path = "../libturbojpeg" }
 varraydb = { path = "../varraydb" }
 #vips = { path = "../libvips" }

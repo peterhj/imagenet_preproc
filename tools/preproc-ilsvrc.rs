@@ -16,10 +16,10 @@ fn main() {
 
     //train_data_path:      PathBuf::from("/rscratch/phj/data/ilsvrc2012_scale480_orig_test/ilsvrc2012_scale480_train_data.varraydb"),
     //train_labels_path:    PathBuf::from("/rscratch/phj/data/ilsvrc2012_scale480_orig_test/ilsvrc2012_scale480_train_labels.varraydb"),
-    train_data_path:      PathBuf::from("/rscratch/phj/data/ilsvrc2012_noscalev2_orig/ilsvrc2012_maxscale480_orig_train_data.varraydb"),
-    train_labels_path:    PathBuf::from("/rscratch/phj/data/ilsvrc2012_noscalev2_orig/ilsvrc2012_maxscale480_orig_train_labels.varraydb"),
-    valid_data_path:      PathBuf::from("/rscratch/phj/data/ilsvrc2012_noscalev2_orig/ilsvrc2012_scale256_orig_valid_data.varraydb"),
-    valid_labels_path:    PathBuf::from("/rscratch/phj/data/ilsvrc2012_noscalev2_orig/ilsvrc2012_scale256_orig_valid_labels.varraydb"),
+    train_data_path:      PathBuf::from("/rscratch/phj/data/ilsvrc2012_multiv2_orig/ilsvrc2012_maxscale480_orig_train_data.varraydb"),
+    train_labels_path:    PathBuf::from("/rscratch/phj/data/ilsvrc2012_multiv2_orig/ilsvrc2012_maxscale480_orig_train_labels.varraydb"),
+    valid_data_path:      PathBuf::from("/rscratch/phj/data/ilsvrc2012_multiv2_orig/ilsvrc2012_scale256_orig_valid_data.varraydb"),
+    valid_labels_path:    PathBuf::from("/rscratch/phj/data/ilsvrc2012_multiv2_orig/ilsvrc2012_scale256_orig_valid_labels.varraydb"),
   };
 
   config.preproc_train_data();

@@ -2,6 +2,7 @@ extern crate array_cuda;
 extern crate array_new;
 extern crate epeg;
 extern crate rembrandt_kernels;
+extern crate turbojpeg;
 extern crate varraydb;
 //extern crate vips;
 
@@ -25,6 +26,7 @@ use array_cuda::device::context::{DeviceContext};
 use array_cuda::device::memory::{DeviceZeroExt, DeviceBuffer};
 use array_new::{ArrayZeroExt, NdArraySerialize, Array3d};
 use rembrandt_kernels::ffi::*;
+use turbojpeg::{TurbojpegDecoder, TurbojpegEncoder};
 use varraydb::{VarrayDb};
 
 use byteorder::{WriteBytesExt, LittleEndian};
@@ -267,6 +269,203 @@ impl MagickEncoderWorker {
   }
 }*/
 
+struct ValidTurboEncoderWorker {
+  config:       IlsvrcConfig,
+  encoder_rx:   Receiver<EncoderMsg>,
+  writer_tx:    SyncSender<WriterMsg>,
+}
+
+impl ValidTurboEncoderWorker {
+  pub fn run(&mut self, dev_idx: usize) {
+    let context = DeviceContext::new(dev_idx);
+    let ctx = &context.as_ref();
+    // XXX(20160505): this takes about 9 GB; yes, some images are large.
+    let mut resize_src_buf = DeviceBuffer::<f32>::zeros(384 * 1024 * 1024 * 3, ctx);
+    let mut resize_dst_buf = DeviceBuffer::<f32>::zeros(384 * 1024 * 1024 * 3, ctx);
+
+    let mut decoder = TurbojpegDecoder::create().unwrap();
+    let mut encoder = TurbojpegEncoder::create().unwrap();
+
+    loop {
+      match self.encoder_rx.recv() {
+        Err(_) => {
+          break;
+        }
+
+        Ok(EncoderMsg::Quit) => {
+          break;
+        }
+
+        Ok(EncoderMsg::RawImageFile(idx, rawcat, buf)) => {
+          let top_10k = if idx < 10000 {
+            0
+          } else if idx < 20000 {
+            1
+          } else if idx < 30000 {
+            2
+          } else if idx < 40000 {
+            3
+          } else if idx < 50000 {
+            4
+          } else {
+            unreachable!();
+          };
+
+          let image_arr = match decoder.decode_rgb8(&buf) {
+            Err(e) => {
+              println!("WARNING: turbo decoder failed: {}", idx);
+              let im_arr = Array3d::<u8>::zeros((256, 256, 3));
+              im_arr
+            }
+
+            Ok((header, data)) => {
+              let mut im = Image::new(header.width, header.height, 3, data);
+
+              //assert_eq!(3, im.depth);
+              if im.depth != 3 && im.depth != 1 {
+                panic!("WARNING: stb loaded an unsupported depth: {} {}", idx, im.depth);
+              }
+              assert_eq!(im.depth * im.width * im.height, im.data.len());
+
+              if im.depth == 1 {
+                let mut rgb_data = Vec::with_capacity(3 * im.width * im.height);
+                assert_eq!(im.width * im.height, im.data.len());
+                for i in 0 .. im.data.len() {
+                  rgb_data.push(im.data[i]);
+                  rgb_data.push(im.data[i]);
+                  rgb_data.push(im.data[i]);
+                }
+                assert_eq!(3 * im.width * im.height, rgb_data.len());
+                im = Image::new(im.width, im.height, 3, rgb_data);
+              }
+              assert_eq!(3, im.depth);
+
+              {
+                let buf = match im.write_png() {
+                  Err(e) => panic!("stb failed to write png: {} {:?}", idx, e),
+                  Ok(buf) => buf,
+                };
+                let orig_path = PathBuf::from(&format!("tmp/preproc_debug/{}/valid_{}_orig.png", top_10k, idx));
+                let mut orig_file = File::create(&orig_path).unwrap();
+                orig_file.write_all(&buf).unwrap();
+              }
+
+              let orig_w = im.width;
+              let orig_h = im.height;
+              let min_dim = min(orig_w, orig_h);
+              if min_dim != 256 {
+                let (new_w, new_h) = if min_dim == orig_w {
+                  (256, (256 as f32 / orig_w as f32 * orig_h as f32).round() as usize)
+                } else {
+                  ((256 as f32 / orig_h as f32 * orig_w as f32).round() as usize, 256)
+                };
+
+                let mut src_buf_h = Vec::with_capacity(3 * im.width * im.height);
+                for c in 0 .. 3 {
+                  for y in 0 .. im.height {
+                    for x in 0 .. im.width {
+                      src_buf_h.push(im.data[c + x * 3 + y * 3 * im.width] as f32 / 255.0);
+                    }
+                  }
+                }
+
+                resize_src_buf.as_ref_mut_range(0, orig_w * orig_h * 3, ctx)
+                  .sync_load(&src_buf_h);
+
+                let mut curr_w = orig_w;
+                let mut curr_h = orig_h;
+                while (curr_w+1)/2 >= new_w && (curr_h+1)/2 >= new_h {
+                  unsafe { rembrandt_kernel_image3_bilinear_scale(
+                      resize_src_buf.as_ref(ctx).as_ptr(),
+                      curr_w as i32, curr_h as i32, 3,
+                      resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
+                      ((curr_w+1)/2) as i32, ((curr_h+1)/2) as i32,
+                      ctx.stream.ptr,
+                  ) };
+                  resize_dst_buf.as_ref(ctx).send(&mut resize_src_buf.as_ref_mut(ctx));
+                  curr_w = (curr_w+1)/2;
+                  curr_h = (curr_h+1)/2;
+                }
+                if curr_w != new_w || curr_h != new_h {
+                  unsafe { rembrandt_kernel_image3_bicubic_scale(
+                      resize_src_buf.as_ref(ctx).as_ptr(),
+                      curr_w as i32, curr_h as i32, 3,
+                      resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
+                      new_w as i32, new_h as i32,
+                      ctx.stream.ptr,
+                  ) };
+                }
+
+                let mut dst_buf_h = Vec::with_capacity(new_w * new_h * 3);
+                for _ in 0 .. 3 * new_w * new_h {
+                  dst_buf_h.push(0.0);
+                }
+
+                resize_dst_buf.as_ref_range(0, new_w * new_h * 3, ctx)
+                  .sync_store(&mut dst_buf_h);
+
+                let mut resize_im = Image::new(new_w, new_h, 3, repeat(0).take(new_w * new_h * 3).collect());
+                for y in 0 .. new_h {
+                  for x in 0 .. new_w {
+                    for c in 0 .. 3 {
+                      resize_im.data[c + x * 3 + y * 3 * new_w]
+                          = (dst_buf_h[x + y * new_w + c * new_w * new_h] * 255.0).max(0.0).min(255.0).round() as u8;
+                    }
+                  }
+                }
+
+                {
+                  let buf = match resize_im.write_png() {
+                    Err(e) => panic!("stb failed to write png: {} {:?}", idx, e),
+                    Ok(buf) => buf,
+                  };
+                  let resize_path = PathBuf::from(&format!("tmp/preproc_debug/{}/valid_{}_resize.png", top_10k, idx));
+                  let mut resize_file = File::create(&resize_path).unwrap();
+                  resize_file.write_all(&buf).unwrap();
+                }
+
+                /*match im.resize(&mut resize_im) {
+                  Err(e) => {
+                    println!("WARNING: stb failed to resize image: {} {:?}", k, e);
+                    continue;
+                  }
+                  Ok(_) => {}
+                }*/
+
+                im = resize_im;
+              }
+
+              let mut trans_data = Vec::with_capacity(3 * im.width * im.height);
+              for c in 0 .. 3 {
+                for y in 0 .. im.height {
+                  for x in 0 .. im.width {
+                    trans_data.push(im.data[c + x * 3 + y * 3 * im.width]);
+                  }
+                }
+              }
+              assert_eq!(im.depth * im.width * im.height, trans_data.len());
+              let im_arr = Array3d::<u8>::with_data(trans_data, (im.width, im.height, 3));
+              im_arr
+            }
+          };
+
+          let mut encoded_arr = vec![];
+          match image_arr.serialize(&mut encoded_arr) {
+            Err(e) => panic!("array serialization error: {:?}", e),
+            Ok(_) => {}
+          }
+          self.writer_tx.send(
+              WriterMsg::ImageFile(idx, rawcat, encoded_arr),
+          ).unwrap();
+        }
+      }
+    }
+    self.writer_tx.send(
+        WriterMsg::Quit,
+    ).unwrap();
+  }
+}
+
 struct ValidStbEncoderWorker {
   config:       IlsvrcConfig,
   encoder_rx:   Receiver<EncoderMsg>,
@@ -363,9 +562,23 @@ impl ValidStbEncoderWorker {
                 resize_src_buf.as_ref_mut_range(0, orig_w * orig_h * 3, ctx)
                   .sync_load(&src_buf_h);
 
+                let mut curr_w = orig_w;
+                let mut curr_h = orig_h;
+                while (curr_w+1)/2 >= new_w && (curr_h+1)/2 >= new_h {
+                  unsafe { rembrandt_kernel_image3_bilinear_scale(
+                      resize_src_buf.as_ref(ctx).as_ptr(),
+                      curr_w as i32, curr_h as i32, 3,
+                      resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
+                      ((curr_w+1)/2) as i32, ((curr_h+1)/2) as i32,
+                      ctx.stream.ptr,
+                  ) };
+                  resize_dst_buf.as_ref(ctx).send(&mut resize_src_buf.as_ref_mut(ctx));
+                  curr_w = (curr_w+1)/2;
+                  curr_h = (curr_h+1)/2;
+                }
                 unsafe { rembrandt_kernel_image3_bicubic_scale(
                     resize_src_buf.as_ref(ctx).as_ptr(),
-                    orig_w as i32, orig_h as i32, 3,
+                    curr_w as i32, curr_h as i32, 3,
                     resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
                     new_w as i32, new_h as i32,
                     ctx.stream.ptr,
@@ -438,6 +651,310 @@ impl ValidStbEncoderWorker {
         }
       }
     }
+    self.writer_tx.send(
+        WriterMsg::Quit,
+    ).unwrap();
+  }
+}
+
+struct TurboEncoderWorker {
+  config:       IlsvrcConfig,
+  encoder_rx:   Receiver<EncoderMsg>,
+  writer_tx:    SyncSender<WriterMsg>,
+}
+
+impl TurboEncoderWorker {
+  pub fn run(&mut self, dev_idx: usize) {
+    let context = DeviceContext::new(dev_idx);
+    let ctx = &context.as_ref();
+    // XXX(20160505): this takes about 9 GB; yes, some images are large.
+    let mut resize_src_buf = DeviceBuffer::<f32>::zeros(384 * 1024 * 1024 * 3, ctx);
+    let mut resize_dst_buf = DeviceBuffer::<f32>::zeros(384 * 1024 * 1024 * 3, ctx);
+
+    let mut decoder = TurbojpegDecoder::create().unwrap();
+    let mut encoder = TurbojpegEncoder::create().unwrap();
+
+    let mut max_w = 0;
+    let mut max_h = 0;
+    let mut max_ratio = 1.0;
+    loop {
+      match self.encoder_rx.recv() {
+        Err(_) => {
+          break;
+        }
+
+        Ok(EncoderMsg::Quit) => {
+          break;
+        }
+
+        Ok(EncoderMsg::RawImageFile(idx, rawcat, buf)) => {
+          {
+            let mut image = match decoder.decode_rgb8(&buf) {
+              Err(e) => {
+                println!("WARNING: turbo decoder failed: {}", idx);
+                self.writer_tx.send(
+                    WriterMsg::Skip(idx),
+                ).unwrap();
+                continue;
+              }
+
+              Ok((header, data)) => {
+                let mut im = Image::new(header.width, header.height, 3, data);
+
+                if im.depth != 3 && im.depth != 1 {
+                  println!("WARNING: stb loaded an unsupported depth: {} {}", idx, im.depth);
+                  self.writer_tx.send(
+                      WriterMsg::Skip(idx),
+                  ).unwrap();
+                  continue;
+                }
+                assert_eq!(im.depth * im.width * im.height, im.data.len());
+
+                if im.depth == 1 {
+                  let mut rgb_data = Vec::with_capacity(3 * im.width * im.height);
+                  assert_eq!(im.width * im.height, im.data.len());
+                  for i in 0 .. im.data.len() {
+                    rgb_data.push(im.data[i]);
+                    rgb_data.push(im.data[i]);
+                    rgb_data.push(im.data[i]);
+                  }
+                  assert_eq!(3 * im.width * im.height, rgb_data.len());
+                  im = Image::new(im.width, im.height, 3, rgb_data);
+                }
+                assert_eq!(3, im.depth);
+
+                im
+              }
+            };
+
+            let orig_w = image.width;
+            let orig_h = image.height;
+            //let orig_pitch = image.pitch();
+            if orig_w as f32 / orig_h as f32 > max_ratio {
+              max_ratio = orig_w as f32 / orig_h as f32;
+              println!("DEBUG: new max ratio (wide): {} {:.3}", idx, max_ratio);
+              {
+                let div_10k = idx / 10000;
+                let dump_dir = PathBuf::from(&format!("tmp/preproc_train_debug/{}", div_10k));
+                create_dir_all(&dump_dir).ok();
+
+                let mut orig_path = dump_dir.clone();
+                orig_path.push(&format!("train_{}_orig.jpg", idx));
+                let mut orig_file = File::create(&orig_path).unwrap();
+                orig_file.write_all(&buf).unwrap();
+              }
+            } else if orig_h as f32 / orig_w as f32 > max_ratio {
+              max_ratio = orig_h as f32 / orig_w as f32;
+              println!("DEBUG: new max ratio (high): {} {:.3}", idx, max_ratio);
+              {
+                let div_10k = idx / 10000;
+                let dump_dir = PathBuf::from(&format!("tmp/preproc_train_debug/{}", div_10k));
+                create_dir_all(&dump_dir).ok();
+
+                let mut orig_path = dump_dir.clone();
+                orig_path.push(&format!("train_{}_orig.jpg", idx));
+                let mut orig_file = File::create(&orig_path).unwrap();
+                orig_file.write_all(&buf).unwrap();
+              }
+            }
+            if orig_w > max_w {
+              max_w = orig_w;
+              println!("DEBUG: new max width: {} {}", idx, max_w);
+            }
+            if orig_h > max_h {
+              max_h = orig_h;
+              println!("DEBUG: new max width: {} {}", idx, max_h);
+            }
+
+            let min_dim = min(orig_w, orig_h);
+
+            let encoded_buf = if min_dim <= 480 {
+              buf
+
+            } else {
+              let (new_w, new_h) = if min_dim == orig_w {
+                (480, (480 as f32 / orig_w as f32 * orig_h as f32).round() as usize)
+              } else {
+                ((480 as f32 / orig_h as f32 * orig_w as f32).round() as usize, 480)
+              };
+
+              let mut src_buf_h = Vec::with_capacity(3 * image.width * image.height);
+              for c in 0 .. 3 {
+                for y in 0 .. image.height {
+                  for x in 0 .. image.width {
+                    src_buf_h.push(image.data[c + x * 3 + y * 3 * image.width] as f32 / 255.0);
+                  }
+                }
+              }
+
+              resize_src_buf.as_ref_mut_range(0, orig_w * orig_h * 3, ctx)
+                .sync_load(&src_buf_h);
+
+              /*unsafe { rembrandt_kernel_image3_bicubic_scale(
+                  resize_src_buf.as_ref(ctx).as_ptr(),
+                  orig_w as i32, orig_h as i32, 3,
+                  resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
+                  new_w as i32, new_h as i32,
+                  ctx.stream.ptr,
+              ) };*/
+              let mut curr_w = orig_w;
+              let mut curr_h = orig_h;
+              while (curr_w+1)/2 >= new_w && (curr_h+1)/2 >= new_h {
+                unsafe { rembrandt_kernel_image3_bilinear_scale(
+                    resize_src_buf.as_ref(ctx).as_ptr(),
+                    curr_w as i32, curr_h as i32, 3,
+                    resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
+                    ((curr_w+1)/2) as i32, ((curr_h+1)/2) as i32,
+                    ctx.stream.ptr,
+                ) };
+                resize_dst_buf.as_ref(ctx).send(&mut resize_src_buf.as_ref_mut(ctx));
+                curr_w = (curr_w+1)/2;
+                curr_h = (curr_h+1)/2;
+              }
+              assert!(curr_w >= new_w);
+              assert!(curr_h >= new_h);
+              if curr_w > new_w || curr_h > new_h {
+                unsafe { rembrandt_kernel_image3_bicubic_scale(
+                    resize_src_buf.as_ref(ctx).as_ptr(),
+                    curr_w as i32, curr_h as i32, 3,
+                    resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
+                    new_w as i32, new_h as i32,
+                    ctx.stream.ptr,
+                ) };
+              } else {
+                assert_eq!(curr_w, new_w);
+                assert_eq!(curr_h, new_h);
+              }
+
+              let mut dst_buf_h = Vec::with_capacity(new_w * new_h * 3);
+              for _ in 0 .. 3 * new_w * new_h {
+                dst_buf_h.push(0.0);
+              }
+
+              resize_dst_buf.as_ref_range(0, new_w * new_h * 3, ctx)
+                .sync_store(&mut dst_buf_h);
+
+              let mut resize_image = Image::new(new_w, new_h, 3, repeat(0).take(new_w * new_h * 3).collect());
+              for y in 0 .. new_h {
+                for x in 0 .. new_w {
+                  for c in 0 .. 3 {
+                    resize_image.data[c + x * 3 + y * 3 * new_w]
+                        = (dst_buf_h[x + y * new_w + c * new_w * new_h] * 255.0).max(0.0).min(255.0).round() as u8;
+                  }
+                }
+              }
+
+              let mut encoded_buf = match encoder.encode_rgb8(&resize_image.data, resize_image.width, resize_image.height) {
+                Err(e) => {
+                  println!("WARNING: turbo failed encode: {}", idx);
+                  self.writer_tx.send(
+                      WriterMsg::Skip(idx),
+                  ).unwrap();
+                  continue;
+                }
+                Ok(buf) => buf,
+              };
+
+              /*// FIXME(20160505): encode resized image as PNG.
+              let mut resize_imagebuf = match ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(new_w as u32, new_h as u32, resize_image.data) {
+                None => {
+                  println!("WARNING: failed to make piston imagebuffer from raw bytes: {}", idx);
+                  self.writer_tx.send(
+                      WriterMsg::Skip(idx),
+                  ).unwrap();
+                  continue;
+                }
+                Some(imagebuf) => imagebuf,
+              };
+
+              let mut encoded_buf = vec![];
+              let dynimage = DynamicImage::ImageRgb8(resize_imagebuf);
+              match dynimage.save(&mut encoded_buf, ImageFormat::JPEG) {
+                Err(e) => {
+                  println!("WARNING: failed to encode old image as jpg: {} {:?}", idx, e);
+                  self.writer_tx.send(
+                      WriterMsg::Skip(idx),
+                  ).unwrap();
+                  continue;
+                }
+                Ok(_) => {}
+              }*/
+
+              {
+                let div_10k = idx / 10000;
+                let dump_dir = PathBuf::from(&format!("tmp/preproc_train_debug/{}", div_10k));
+                create_dir_all(&dump_dir).ok();
+                //let resize_path = PathBuf::from(&format!("tmp/preproc_train_debug/{}/valid_{}_resize.png", div_10k, idx));
+
+                let mut orig_path = dump_dir.clone();
+                orig_path.push(&format!("train_{}_orig.jpg", idx));
+                let mut orig_file = File::create(&orig_path).unwrap();
+                orig_file.write_all(&buf).unwrap();
+
+                let mut resize_path = dump_dir.clone();
+                resize_path.push(&format!("train_{}_resize.jpg", idx));
+                let mut resize_file = File::create(&resize_path).unwrap();
+                resize_file.write_all(&encoded_buf).unwrap();
+              }
+
+              /*{
+                let mut test_reader = Cursor::new(&encoded_buf);
+                match load(test_reader, ImageFormat::JPEG) {
+                  Err(e) => {
+                    println!("WARNING: failed to decode the encoded image as jpg: {} {:?}", idx, e);
+                    self.writer_tx.send(
+                        WriterMsg::Skip(idx),
+                    ).unwrap();
+                    continue;
+                  }
+                  Ok(_) => {}
+                }
+              }
+
+              {
+                let mut test_image = match load_from_memory(&encoded_buf) {
+                  LoadResult::ImageU8(im) => im,
+                  _ => {
+                    println!("WARNING: failed to decode the encoded image as jpg (stb): {}", idx);
+                    self.writer_tx.send(
+                        WriterMsg::Skip(idx),
+                    ).unwrap();
+                    continue;
+                  }
+                };
+                assert_eq!(new_w, test_image.width);
+                assert_eq!(new_h, test_image.height);
+                assert_eq!(3, test_image.depth);
+              }*/
+
+              {
+                match decoder.decode_rgb8(&encoded_buf) {
+                  Err(e) => {
+                    println!("WARNING: turbo decoder failed to decode encoded jpeg: {}", idx);
+                    self.writer_tx.send(
+                        WriterMsg::Skip(idx),
+                    ).unwrap();
+                    continue;
+                  }
+                  Ok((header, data)) => {
+                    assert_eq!(new_w, header.width);
+                    assert_eq!(new_h, header.height);
+                    assert_eq!(new_w * new_h * 3, data.len());
+                  }
+                }
+              }
+
+              encoded_buf
+            };
+
+            self.writer_tx.send(
+                WriterMsg::ImageFile(idx, rawcat, encoded_buf),
+            ).unwrap();
+          }
+        }
+      }
+    }
+    println!("DEBUG: encoder: max_w: {} max_h: {} max_ratio: {:.3}", max_w, max_h, max_ratio);
     self.writer_tx.send(
         WriterMsg::Quit,
     ).unwrap();
@@ -520,10 +1037,30 @@ impl StbEncoderWorker {
             //let orig_pitch = image.pitch();
             if orig_w as f32 / orig_h as f32 > max_ratio {
               max_ratio = orig_w as f32 / orig_h as f32;
-              println!("DEBUG: new max ratio: {} {:.3}", idx, max_ratio);
+              println!("DEBUG: new max ratio (wide): {} {:.3}", idx, max_ratio);
+              {
+                let div_10k = idx / 10000;
+                let dump_dir = PathBuf::from(&format!("tmp/preproc_train_debug/{}", div_10k));
+                create_dir_all(&dump_dir).ok();
+
+                let mut orig_path = dump_dir.clone();
+                orig_path.push(&format!("train_{}_orig.jpg", idx));
+                let mut orig_file = File::create(&orig_path).unwrap();
+                orig_file.write_all(&buf).unwrap();
+              }
             } else if orig_h as f32 / orig_w as f32 > max_ratio {
               max_ratio = orig_h as f32 / orig_w as f32;
-              println!("DEBUG: new max ratio: {} {:.3}", idx, max_ratio);
+              println!("DEBUG: new max ratio (high): {} {:.3}", idx, max_ratio);
+              {
+                let div_10k = idx / 10000;
+                let dump_dir = PathBuf::from(&format!("tmp/preproc_train_debug/{}", div_10k));
+                create_dir_all(&dump_dir).ok();
+
+                let mut orig_path = dump_dir.clone();
+                orig_path.push(&format!("train_{}_orig.jpg", idx));
+                let mut orig_file = File::create(&orig_path).unwrap();
+                orig_file.write_all(&buf).unwrap();
+              }
             }
             if orig_w > max_w {
               max_w = orig_w;
@@ -558,13 +1095,38 @@ impl StbEncoderWorker {
               resize_src_buf.as_ref_mut_range(0, orig_w * orig_h * 3, ctx)
                 .sync_load(&src_buf_h);
 
-              unsafe { rembrandt_kernel_image3_bicubic_scale(
+              /*unsafe { rembrandt_kernel_image3_bicubic_scale(
                   resize_src_buf.as_ref(ctx).as_ptr(),
                   orig_w as i32, orig_h as i32, 3,
                   resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
                   new_w as i32, new_h as i32,
                   ctx.stream.ptr,
-              ) };
+              ) };*/
+              let mut curr_w = orig_w;
+              let mut curr_h = orig_h;
+              while (curr_w+1)/2 >= new_w && (curr_h+1)/2 >= new_h {
+                unsafe { rembrandt_kernel_image3_bilinear_scale(
+                    resize_src_buf.as_ref(ctx).as_ptr(),
+                    curr_w as i32, curr_h as i32, 3,
+                    resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
+                    ((curr_w+1)/2) as i32, ((curr_h+1)/2) as i32,
+                    ctx.stream.ptr,
+                ) };
+                resize_dst_buf.as_ref(ctx).send(&mut resize_src_buf.as_ref_mut(ctx));
+                curr_w = (curr_w+1)/2;
+                curr_h = (curr_h+1)/2;
+              }
+              assert!(curr_w >= new_w);
+              assert!(curr_h >= new_h);
+              if curr_w > new_w || curr_h > new_h {
+                unsafe { rembrandt_kernel_image3_bicubic_scale(
+                    resize_src_buf.as_ref(ctx).as_ptr(),
+                    curr_w as i32, curr_h as i32, 3,
+                    resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
+                    new_w as i32, new_h as i32,
+                    ctx.stream.ptr,
+                ) };
+              }
 
               let mut dst_buf_h = Vec::with_capacity(new_w * new_h * 3);
               for _ in 0 .. 3 * new_w * new_h {
@@ -1102,23 +1664,24 @@ impl WriterWorker {
           assert_eq!(4, label_buf.len());
 
           if idx == self.counter {
+            assert!(!cache.contains_key(&self.counter));
             data_db.append(&buf);
             labels_db.append(&label_buf);
             self.counter += 1;
           } else {
             cache.insert(idx, (buf, label_buf));
-            loop {
-              if cache.contains_key(&self.counter) {
-                let (buf, label_buf) = cache.remove(&self.counter).unwrap();
-                data_db.append(&buf);
-                labels_db.append(&label_buf);
-                self.counter += 1;
-              } else if skip_set.contains(&self.counter) {
-                //adj_idx += 1;
-                self.counter += 1;
-              } else {
-                break;
-              }
+          }
+          loop {
+            if cache.contains_key(&self.counter) {
+              let (buf, label_buf) = cache.remove(&self.counter).unwrap();
+              data_db.append(&buf);
+              labels_db.append(&label_buf);
+              self.counter += 1;
+            } else if skip_set.contains(&self.counter) {
+              //adj_idx += 1;
+              self.counter += 1;
+            } else {
+              break;
             }
           }
 
@@ -1192,23 +1755,24 @@ impl ValidWriterWorker {
           assert_eq!(4, label_buf.len());
 
           if idx == self.counter {
+            assert!(!cache.contains_key(&self.counter));
             data_db.append(&buf);
             labels_db.append(&label_buf);
             self.counter += 1;
           } else {
             cache.insert(idx, (buf, label_buf));
-            loop {
-              if cache.contains_key(&self.counter) {
-                let (buf, label_buf) = cache.remove(&self.counter).unwrap();
-                data_db.append(&buf);
-                labels_db.append(&label_buf);
-                self.counter += 1;
-              } else if skip_set.contains(&self.counter) {
-                //adj_idx += 1;
-                self.counter += 1;
-              } else {
-                break;
-              }
+          }
+          loop {
+            if cache.contains_key(&self.counter) {
+              let (buf, label_buf) = cache.remove(&self.counter).unwrap();
+              data_db.append(&buf);
+              labels_db.append(&label_buf);
+              self.counter += 1;
+            } else if skip_set.contains(&self.counter) {
+              //adj_idx += 1;
+              self.counter += 1;
+            } else {
+              break;
             }
           }
 
@@ -1292,7 +1856,8 @@ impl IlsvrcConfig {
         //VipsEncoderWorker{
         //EpegEncoderWorker{
         //SdlEncoderWorker{
-        StbEncoderWorker{
+        //StbEncoderWorker{
+        TurboEncoderWorker{
           config:     config,
           encoder_rx: encoder_rx,
           writer_tx:  writer_tx,
@@ -1373,7 +1938,8 @@ impl IlsvrcConfig {
       let encoder_rx = encoder_rxs[i].take().unwrap();
       let writer_tx = writer_tx.clone();
       encoder_pool.execute(move || {
-        ValidStbEncoderWorker{
+        //ValidStbEncoderWorker{
+        ValidTurboEncoderWorker{
           config:     config,
           encoder_rx: encoder_rx,
           writer_tx:  writer_tx,
