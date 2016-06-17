@@ -375,7 +375,7 @@ impl ValidTurboEncoderWorker {
                 let mut curr_w = orig_w;
                 let mut curr_h = orig_h;
                 while (curr_w+1)/2 >= new_w && (curr_h+1)/2 >= new_h {
-                  unsafe { rembrandt_kernel_image3_bilinear_scale(
+                  unsafe { rembrandt_kernel_image3_2x2_bilinear_scale(
                       resize_src_buf.as_ref(ctx).as_ptr(),
                       curr_w as i32, curr_h as i32, 3,
                       resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
@@ -386,7 +386,28 @@ impl ValidTurboEncoderWorker {
                   curr_w = (curr_w+1)/2;
                   curr_h = (curr_h+1)/2;
                 }
-                if curr_w != new_w || curr_h != new_h {
+                if curr_w == new_w && curr_h == new_h {
+                  // Do nothing.
+                } else {
+                  // Resample both ways using Catmull-Rom filter.
+                  unsafe { rembrandt_kernel_image3_catmullrom_scale(
+                      resize_src_buf.as_ref(ctx).as_ptr(),
+                      curr_w as i32, curr_h as i32, 3,
+                      resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
+                      new_w as i32, new_h as i32,
+                      ctx.stream.ptr,
+                  ) };
+                /*} else if curr_w > new_w || curr_h > new_h {
+                  // Downsample using Catmull-Rom filter.
+                  unsafe { rembrandt_kernel_image3_catmullrom_scale(
+                      resize_src_buf.as_ref(ctx).as_ptr(),
+                      curr_w as i32, curr_h as i32, 3,
+                      resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
+                      new_w as i32, new_h as i32,
+                      ctx.stream.ptr,
+                  ) };
+                } else if curr_w < new_w || curr_h < new_h {
+                  // Upsample using bicubic (B-spline) filter.
                   unsafe { rembrandt_kernel_image3_bicubic_scale(
                       resize_src_buf.as_ref(ctx).as_ptr(),
                       curr_w as i32, curr_h as i32, 3,
@@ -394,6 +415,8 @@ impl ValidTurboEncoderWorker {
                       new_w as i32, new_h as i32,
                       ctx.stream.ptr,
                   ) };
+                } else {
+                  unreachable!();*/
                 }
 
                 let mut dst_buf_h = Vec::with_capacity(new_w * new_h * 3);
@@ -565,7 +588,7 @@ impl ValidStbEncoderWorker {
                 let mut curr_w = orig_w;
                 let mut curr_h = orig_h;
                 while (curr_w+1)/2 >= new_w && (curr_h+1)/2 >= new_h {
-                  unsafe { rembrandt_kernel_image3_bilinear_scale(
+                  unsafe { rembrandt_kernel_image3_2x2_bilinear_scale(
                       resize_src_buf.as_ref(ctx).as_ptr(),
                       curr_w as i32, curr_h as i32, 3,
                       resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
@@ -576,7 +599,7 @@ impl ValidStbEncoderWorker {
                   curr_w = (curr_w+1)/2;
                   curr_h = (curr_h+1)/2;
                 }
-                unsafe { rembrandt_kernel_image3_bicubic_scale(
+                unsafe { rembrandt_kernel_image3_catmullrom_scale(
                     resize_src_buf.as_ref(ctx).as_ptr(),
                     curr_w as i32, curr_h as i32, 3,
                     resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
@@ -691,11 +714,41 @@ impl TurboEncoderWorker {
           {
             let mut image = match decoder.decode_rgb8(&buf) {
               Err(e) => {
-                println!("WARNING: turbo decoder failed: {}", idx);
-                self.writer_tx.send(
-                    WriterMsg::Skip(idx),
-                ).unwrap();
-                continue;
+                match load_from_memory(&buf) {
+                  LoadResult::Error(_) |
+                  LoadResult::ImageF32(_) => {
+                    println!("WARNING: turbo backup stb failed to load jpg: {}", idx);
+                    self.writer_tx.send(
+                        WriterMsg::Skip(idx),
+                    ).unwrap();
+                    continue;
+                  }
+                  LoadResult::ImageU8(mut im) => {
+                    if im.depth != 3 && im.depth != 1 {
+                      println!("WARNING: stb loaded an unsupported depth: {} {}", idx, im.depth);
+                      self.writer_tx.send(
+                          WriterMsg::Skip(idx),
+                      ).unwrap();
+                      continue;
+                    }
+                    assert_eq!(im.depth * im.width * im.height, im.data.len());
+
+                    if im.depth == 1 {
+                      let mut rgb_data = Vec::with_capacity(3 * im.width * im.height);
+                      assert_eq!(im.width * im.height, im.data.len());
+                      for i in 0 .. im.data.len() {
+                        rgb_data.push(im.data[i]);
+                        rgb_data.push(im.data[i]);
+                        rgb_data.push(im.data[i]);
+                      }
+                      assert_eq!(3 * im.width * im.height, rgb_data.len());
+                      im = Image::new(im.width, im.height, 3, rgb_data);
+                    }
+                    assert_eq!(3, im.depth);
+
+                    im
+                  }
+                }
               }
 
               Ok((header, data)) => {
@@ -800,7 +853,7 @@ impl TurboEncoderWorker {
               let mut curr_w = orig_w;
               let mut curr_h = orig_h;
               while (curr_w+1)/2 >= new_w && (curr_h+1)/2 >= new_h {
-                unsafe { rembrandt_kernel_image3_bilinear_scale(
+                unsafe { rembrandt_kernel_image3_2x2_bilinear_scale(
                     resize_src_buf.as_ref(ctx).as_ptr(),
                     curr_w as i32, curr_h as i32, 3,
                     resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
@@ -814,7 +867,7 @@ impl TurboEncoderWorker {
               assert!(curr_w >= new_w);
               assert!(curr_h >= new_h);
               if curr_w > new_w || curr_h > new_h {
-                unsafe { rembrandt_kernel_image3_bicubic_scale(
+                unsafe { rembrandt_kernel_image3_catmullrom_scale(
                     resize_src_buf.as_ref(ctx).as_ptr(),
                     curr_w as i32, curr_h as i32, 3,
                     resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
@@ -1105,7 +1158,7 @@ impl StbEncoderWorker {
               let mut curr_w = orig_w;
               let mut curr_h = orig_h;
               while (curr_w+1)/2 >= new_w && (curr_h+1)/2 >= new_h {
-                unsafe { rembrandt_kernel_image3_bilinear_scale(
+                unsafe { rembrandt_kernel_image3_2x2_bilinear_scale(
                     resize_src_buf.as_ref(ctx).as_ptr(),
                     curr_w as i32, curr_h as i32, 3,
                     resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),
@@ -1119,7 +1172,7 @@ impl StbEncoderWorker {
               assert!(curr_w >= new_w);
               assert!(curr_h >= new_h);
               if curr_w > new_w || curr_h > new_h {
-                unsafe { rembrandt_kernel_image3_bicubic_scale(
+                unsafe { rembrandt_kernel_image3_catmullrom_scale(
                     resize_src_buf.as_ref(ctx).as_ptr(),
                     curr_w as i32, curr_h as i32, 3,
                     resize_dst_buf.as_ref_mut(ctx).as_mut_ptr(),

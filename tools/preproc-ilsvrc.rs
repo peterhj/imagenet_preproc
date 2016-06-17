@@ -22,6 +22,6 @@ fn main() {
     valid_labels_path:    PathBuf::from("/rscratch/phj/data/ilsvrc2012_multiv2_orig/ilsvrc2012_scale256_orig_valid_labels.varraydb"),
   };
 
-  config.preproc_train_data();
-  //config.preproc_valid_data();
+  //config.preproc_train_data();
+  config.preproc_valid_data();
 }
